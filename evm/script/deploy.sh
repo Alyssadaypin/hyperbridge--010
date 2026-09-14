@@ -1,0 +1,435 @@
+#!/bin/bash
+
+# Multi-chain deployment script with simulation and full deployment modes
+# Usage: ./script/deploy-multichain.sh [OPTIONS] <script> <chains>
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Default values
+MODE="simulate"
+
+CONFIG_FILE=""
+NETWORK_FLAG=""
+
+# Function to print usage
+print_usage() {
+    echo -e "${BLUE}Multi-Chain Deployment Script${NC}"
+    echo ""
+    echo "Usage: $0 [OPTIONS] <script> <chains>"
+    echo ""
+    echo "Arguments:"
+    echo "  script          Script name (e.g., DeployHostUpdates.s.sol or DeployHostUpdates)"
+    echo "  chains          Comma-separated chain names matching foundry.toml [rpc_endpoints]"
+    echo "                  (e.g., sepolia,base-sepolia,arbitrum-sepolia)"
+    echo ""
+    echo "Options:"
+    echo "  -m, --mode MODE        Deployment mode: simulate, full, resume, or verify (default: simulate)"
+    echo "                         - simulate: Dry run without broadcasting transactions"
+    echo "                         - full: Broadcast and verify contracts"
+    echo "                         - resume: Resume broadcasting pending transactions and verify"
+    echo "                         - verify: Verify already-deployed contracts using broadcast artifacts (no broadcast)"
+    echo "  -n, --network NET      Network type: testnet or mainnet (sources .env.testnet or .env.mainnet)"
+    echo "  -c, --config FILE      Config file to use (default: from CONFIG env var)"
+
+    echo "  -h, --help             Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  # Simulate deployment (dry run)"
+    echo "  $0 DeployHostUpdates sepolia,base-sepolia"
+    echo ""
+    echo "  # Deploy to testnet chains (sources .env.testnet)"
+    echo "  $0 --mode full --network testnet DeployHostUpdates sepolia,base-sepolia"
+    echo ""
+    echo "  # Deploy to mainnet chains (sources .env.mainnet)"
+    echo "  $0 --mode full --network mainnet DeployIsmp ethereum,base,arbitrum"
+    echo ""
+    echo "  # Deploy to specific chains"
+    echo "  $0 --mode full DeployHostUpdates sepolia,base-sepolia,arbitrum-sepolia"
+    echo ""
+    echo "  # Resume pending broadcast and verify"
+    echo "  $0 --mode resume --network mainnet DeployHostUpdates base"
+    echo ""
+    echo "  # Verify already-deployed contracts (no broadcast)"
+    echo "  $0 --mode verify --network mainnet DeployHostUpdates gnosis"
+    echo ""
+
+    echo ""
+    echo "Available Chains:"
+    echo "  Testnets: sepolia, optimism-sepolia, arbitrum-sepolia, base-sepolia,"
+    echo "            polygon-amoy, bsc-testnet, gnosis-chiado, polkadot-testnet, pharos-testnet"
+    echo ""
+    echo "  Mainnets: ethereum, optimism, arbitrum, base, bsc, gnosis,"
+    echo "            soneium, polygon, unichain, inkchain, sei"
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -m|--mode)
+            MODE="$2"
+            if [[ ! "$MODE" =~ ^(simulate|full|resume|verify)$ ]]; then
+                echo -e "${RED}Error: Invalid mode '$MODE'. Must be 'simulate', 'full', 'resume', or 'verify'${NC}"
+                exit 1
+            fi
+            shift 2
+            ;;
+        -n|--network)
+            NETWORK_FLAG="$2"
+            if [[ ! "$NETWORK_FLAG" =~ ^(testnet|mainnet)$ ]]; then
+                echo -e "${RED}Error: Invalid network '$NETWORK_FLAG'. Must be 'testnet' or 'mainnet'${NC}"
+                exit 1
+            fi
+            shift 2
+            ;;
+        -c|--config)
+            CONFIG_FILE="$2"
+            shift 2
+            ;;
+
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        -*)
+            echo -e "${RED}Error: Unknown option $1${NC}"
+            print_usage
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Check remaining arguments
+if [ $# -lt 2 ]; then
+    echo -e "${RED}Error: Missing required arguments${NC}\n"
+    print_usage
+    exit 1
+fi
+
+SCRIPT_NAME=$1
+CHAINS=$2
+
+# The 'testnet'/'mainnet' chain-list shortcuts were removed — the hardcoded
+# lists drifted from the chains that actually have config sections. Chains are
+# always explicit; -n/--network only selects the .env and config file.
+if [[ "$CHAINS" =~ ^(testnet|mainnet)$ ]]; then
+    echo -e "${RED}Error: '$CHAINS' is no longer a valid chains value.${NC}"
+    echo "Pass explicit chain names (comma-separated) and select the network with -n, e.g.:"
+    echo "  $0 -m full -n $CHAINS <Script> chain1,chain2"
+    exit 1
+fi
+
+# Source .env file based on network flag
+if [ "$NETWORK_FLAG" = "testnet" ]; then
+    if [ -f ".env.testnet" ]; then
+        echo -e "${YELLOW}Sourcing .env.testnet${NC}"
+        set -a
+        source .env.testnet
+        set +a
+    fi
+    # Auto-set config if not specified
+    if [ -z "$CONFIG_FILE" ] && [ -z "$CONFIG" ]; then
+        export CONFIG=config.testnet.toml
+    fi
+elif [ "$NETWORK_FLAG" = "mainnet" ]; then
+    if [ -f ".env.mainnet" ]; then
+        echo -e "${YELLOW}Sourcing .env.mainnet${NC}"
+        set -a
+        source .env.mainnet
+        set +a
+    fi
+    # Auto-set config if not specified
+    if [ -z "$CONFIG_FILE" ] && [ -z "$CONFIG" ]; then
+        export CONFIG=config.mainnet.toml
+    fi
+fi
+
+# Validate and normalize script name
+if [[ ! "$SCRIPT_NAME" =~ \.s\.sol$ ]]; then
+    SCRIPT_NAME="${SCRIPT_NAME}.s.sol"
+fi
+
+SCRIPT_PATH="script/${SCRIPT_NAME}"
+
+if [ ! -f "$SCRIPT_PATH" ]; then
+    echo -e "${RED}Error: Script not found: $SCRIPT_PATH${NC}"
+    exit 1
+fi
+
+# Set config file
+if [ -n "$CONFIG_FILE" ]; then
+    export CONFIG="$CONFIG_FILE"
+elif [ -z "$CONFIG" ]; then
+    echo -e "${YELLOW}Warning: No CONFIG specified, will use environment default${NC}"
+fi
+
+# Print configuration
+echo -e "${BLUE}╔════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║   Multi-Chain Deployment Script        ║${NC}"
+echo -e "${BLUE}╚════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "${GREEN}Configuration:${NC}"
+echo -e "  Script:    ${YELLOW}${SCRIPT_NAME}${NC}"
+echo -e "  Chains:    ${YELLOW}${CHAINS}${NC}"
+echo -e "  Mode:      ${YELLOW}${MODE}${NC}"
+echo -e "  Config:    ${YELLOW}${CONFIG:-<from env>}${NC}"
+
+
+
+echo ""
+
+# Verify required environment variables
+REQUIRED_VARS=("PRIVATE_KEY" "ADMIN" "VERSION")
+MISSING_VARS=()
+
+for var in "${REQUIRED_VARS[@]}"; do
+    if [ -z "${!var}" ]; then
+        MISSING_VARS+=("$var")
+    fi
+done
+
+if [ ${#MISSING_VARS[@]} -gt 0 ]; then
+    echo -e "${RED}Error: Missing required environment variables:${NC}"
+    for var in "${MISSING_VARS[@]}"; do
+        echo -e "  - ${RED}$var${NC}"
+    done
+    echo ""
+    echo -e "${YELLOW}Hint: Source your .env file or export the required variables${NC}"
+    exit 1
+fi
+
+# Split chains into array
+IFS=',' read -ra CHAIN_ARRAY <<< "$CHAINS"
+
+# Print what we're about to do
+echo -e "${GREEN}Deploying to ${#CHAIN_ARRAY[@]} chain(s):${NC}"
+for chain in "${CHAIN_ARRAY[@]}"; do
+    echo -e "  - ${YELLOW}${chain}${NC}"
+done
+echo ""
+
+# Confirm for full/resume mode
+if [ "$MODE" = "full" ] || [ "$MODE" = "resume" ]; then
+    CHAIN_COUNT=${#CHAIN_ARRAY[@]}
+    echo -e "${YELLOW}⚠️  WARNING: This will broadcast transactions to ${CHAIN_COUNT} chain(s) using real funds.${NC}"
+    echo ""
+
+    read -p "Are you sure you want to proceed? Type 'yes' to continue: " -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+        echo -e "${RED}Deployment cancelled${NC}"
+        exit 1
+    fi
+fi
+
+# Info for verify/resume mode
+if [ "$MODE" = "verify" ]; then
+    echo -e "${BLUE}Verifying existing deployments using broadcast artifacts (no broadcast)...${NC}"
+    echo ""
+elif [ "$MODE" = "resume" ]; then
+    echo -e "${BLUE}Resuming pending broadcasts and verifying contracts...${NC}"
+    echo ""
+fi
+
+# Execute deployment for each chain
+echo -e "${BLUE}════════════════════════════════════════${NC}"
+if [ "$MODE" = "simulate" ]; then
+    echo -e "${GREEN}Starting simulation (no transactions will be broadcast)...${NC}"
+elif [ "$MODE" = "verify" ]; then
+    echo -e "${GREEN}Starting verification (no broadcast)...${NC}"
+elif [ "$MODE" = "resume" ]; then
+    echo -e "${GREEN}Resuming pending broadcasts...${NC}"
+else
+    echo -e "${GREEN}Starting deployment...${NC}"
+fi
+echo -e "${BLUE}════════════════════════════════════════${NC}"
+echo ""
+
+FAILED_CHAINS=()
+SUCCESSFUL_CHAINS=()
+
+# Loop through each chain
+for chain in "${CHAIN_ARRAY[@]}"; do
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}Deploying to: ${chain}${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    # Build forge command for this chain (using single-chain run())
+    FORGE_CMD="forge script $SCRIPT_PATH --sig \"run()\" --rpc-url $chain -g 150"
+
+    # Detect blockscout chains for verification
+    VERIFIER_FLAGS=""
+    case $chain in
+        soneium)
+            VERIFIER_FLAGS="--verifier blockscout --verifier-url https://soneium.blockscout.com/api/ --verifier-api-key $SONEIUM_BLOCKSCOUT_API_KEY"
+            ;;
+        gnosis-chiado)
+            VERIFIER_FLAGS="--verifier blockscout --verifier-url https://gnosis-chiado.blockscout.com/api/ --verifier-api-key $GNOSIS_BLOCKSCOUT_API_KEY"
+            ;;
+        polkadot-testnet)
+            VERIFIER_FLAGS="--verifier blockscout --verifier-url https://blockscout-testnet.polkadot.io/api/"
+            ;;
+        polkadot)
+            VERIFIER_FLAGS="--verifier blockscout --verifier-url https://blockscout.polkadot.io/api/"
+            ;;
+        pharos-testnet)
+            # Pharos uses SocialScan. Its etherscan-compatible endpoint requires any
+            # non-empty --verifier-api-key (the value is ignored). See
+            # https://thehemera.gitbook.io/explorer-api/verify-smart-contract/verify-smart-contract/verify-through-foundry
+            VERIFIER_FLAGS="--verifier etherscan --verifier-url $PHAROS_EXPLORER_API_URL --verifier-api-key ${PHAROS_EXPLORER_API_KEY:-verifyContract}"
+            ;;
+    esac
+
+    # Add flags based on mode
+    if [ "$MODE" = "full" ]; then
+        FORGE_CMD="$FORGE_CMD --broadcast --verify $VERIFIER_FLAGS --sender $ADMIN"
+    elif [ "$MODE" = "resume" ]; then
+        FORGE_CMD="$FORGE_CMD --broadcast --verify $VERIFIER_FLAGS --resume --sender $ADMIN"
+    fi
+
+    if [ "$MODE" = "verify" ]; then
+        # Verify mode: use broadcast artifacts to get tx hashes and verify each contract
+        CHAIN_ID=$(cast chain-id --rpc-url $chain 2>/dev/null)
+        if [ -z "$CHAIN_ID" ]; then
+            echo -e "${RED}Failed to resolve chain ID for $chain${NC}"
+            FAILED_CHAINS+=("$chain")
+            continue
+        fi
+
+        BROADCAST_FILE="broadcast/${SCRIPT_NAME}/${CHAIN_ID}/run-latest.json"
+        if [ ! -f "$BROADCAST_FILE" ]; then
+            echo -e "${RED}No broadcast artifacts found: $BROADCAST_FILE${NC}"
+            FAILED_CHAINS+=("$chain")
+            continue
+        fi
+
+        echo -e "${GREEN}Verifying contracts from: $BROADCAST_FILE${NC}"
+
+        VERIFY_FAILED=false
+
+        # Extract contracts with their creation tx hashes from broadcast
+        python3 -c "
+import json
+with open('$BROADCAST_FILE') as f:
+    data = json.load(f)
+for tx in data.get('transactions', []):
+    if tx.get('transactionType') == 'CREATE2' and tx.get('contractName') and tx.get('contractAddress') and tx.get('hash'):
+        print(f\"{tx['contractName']}|{tx['contractAddress']}|{tx['hash']}\")
+" 2>/dev/null | while IFS='|' read -r contract_name contract_address tx_hash; do
+            [ -z "$contract_name" ] && continue
+            echo -e "  ${YELLOW}Verifying $contract_name at $contract_address (tx: ${tx_hash:0:16}...)${NC}"
+
+            # Use fully qualified name for ambiguous contracts
+            VERIFY_NAME="$contract_name"
+            case $contract_name in
+                SP1Verifier) VERIFY_NAME="lib/sp1-contracts/contracts/src/v6.1.0/SP1VerifierGroth16.sol:SP1Verifier" ;;
+            esac
+
+            # Map RPC alias names to forge --chain names
+            # Use chain ID for chains not in Foundry's built-in list
+            FORGE_CHAIN_NAME="$chain"
+            case $chain in
+                ethereum) FORGE_CHAIN_NAME="mainnet" ;;
+                gnosis) FORGE_CHAIN_NAME="xdai" ;;
+                inkchain) FORGE_CHAIN_NAME="ink" ;;
+                pharos-testnet) FORGE_CHAIN_NAME="$CHAIN_ID" ;;
+                polkadot-testnet) FORGE_CHAIN_NAME="$CHAIN_ID" ;;
+                polkadot) FORGE_CHAIN_NAME="$CHAIN_ID" ;;
+            esac
+
+            if forge verify-contract "$contract_address" "$VERIFY_NAME" \
+                --rpc-url "$chain" --chain "$FORGE_CHAIN_NAME" --watch \
+                --creation-transaction-hash "$tx_hash" \
+                $VERIFIER_FLAGS 2>&1; then
+                echo -e "  ${GREEN}✓ $contract_name verified${NC}"
+            else
+                echo -e "  ${RED}✗ $contract_name verification failed${NC}"
+                VERIFY_FAILED=true
+            fi
+        done
+
+        if [ "$VERIFY_FAILED" = false ]; then
+            SUCCESSFUL_CHAINS+=("$chain")
+            echo ""
+            echo -e "${GREEN}✓ Verification for ${chain} completed${NC}"
+            echo ""
+        else
+            FAILED_CHAINS+=("$chain")
+            echo ""
+            echo -e "${RED}✗ Verification for ${chain} had failures${NC}"
+            echo ""
+        fi
+    else
+        # Execute the forge script command (full/resume/simulate modes)
+        if eval $FORGE_CMD; then
+            SUCCESSFUL_CHAINS+=("$chain")
+            echo ""
+            echo -e "${GREEN}✓ Deployment to ${chain} completed${NC}"
+            echo ""
+        else
+            FAILED_CHAINS+=("$chain")
+            echo ""
+            echo -e "${RED}✗ Deployment to ${chain} failed${NC}"
+            echo ""
+        fi
+    fi
+done
+
+# Print summary
+echo ""
+echo -e "${BLUE}════════════════════════════════════════${NC}"
+echo -e "${YELLOW}Deployment Summary${NC}"
+echo -e "${BLUE}════════════════════════════════════════${NC}"
+echo ""
+
+if [ ${#SUCCESSFUL_CHAINS[@]} -gt 0 ]; then
+    echo -e "${GREEN}Successful (${#SUCCESSFUL_CHAINS[@]}):${NC}"
+    for chain in "${SUCCESSFUL_CHAINS[@]}"; do
+        echo -e "  ✓ ${chain}"
+    done
+    echo ""
+fi
+
+if [ ${#FAILED_CHAINS[@]} -gt 0 ]; then
+    echo -e "${RED}Failed (${#FAILED_CHAINS[@]}):${NC}"
+    for chain in "${FAILED_CHAINS[@]}"; do
+        echo -e "  ✗ ${chain}"
+    done
+    echo ""
+fi
+
+# Final status
+if [ ${#FAILED_CHAINS[@]} -eq 0 ]; then
+    echo -e "${GREEN}✓ All deployments completed successfully!${NC}"
+
+    if [ "$MODE" = "simulate" ]; then
+        echo ""
+        echo -e "${YELLOW}Next steps:${NC}"
+        echo -e "  1. Review the simulation output above"
+        echo -e "  2. To deploy for real, run:"
+        echo -e "     ${BLUE}$0 --mode full --network $NETWORK_FLAG $1 $2${NC}"
+    elif [ "$MODE" = "verify" ]; then
+        echo ""
+        echo -e "${YELLOW}Verification completed using artifacts from:${NC}"
+        echo -e "  broadcast/${SCRIPT_NAME}/<chain-id>/"
+    else
+        echo ""
+        echo -e "${YELLOW}Deployment artifacts saved in:${NC}"
+        echo -e "  broadcast/${SCRIPT_NAME}/<chain-id>/"
+    fi
+    exit 0
+else
+    echo -e "${RED}✗ Some deployments failed${NC}"
+    exit 1
+fi
+

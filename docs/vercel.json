@@ -1,0 +1,49 @@
+{
+  "redirects": [
+    {
+      "source": "/docs/developers/explore/permissionless-relayers",
+      "destination": "/docs/developers/explore/relayers",
+      "permanent": true
+    },
+    {
+      "source": "/docs/developers/explore/permissionless-relayers/:path*",
+      "destination": "/docs/developers/explore/relayers",
+      "permanent": true
+    },
+    {
+      "source": "/docs/developers/explore/relayers/:path*",
+      "destination": "/docs/developers/explore/relayers",
+      "permanent": true
+    },
+    {
+      "source": "/docs/developers/explore/relayer",
+      "destination": "/docs/developers/explore/relayers",
+      "permanent": true
+    },
+    {
+      "source": "/docs/developers/configurations",
+      "destination": "/docs/developers/evm/contract-addresses",
+      "permanent": true
+    },
+    {
+      "source": "/docs/developers/configurations/:path*",
+      "destination": "/docs/developers/evm/contract-addresses/:path*",
+      "permanent": true
+    },
+    {
+      "source": "/protocol/ismp",
+      "destination": "/protocol/ismp/introduction",
+      "permanent": true
+    },
+    {
+      "source": "/developers/evm/intent-gateway/simplex",
+      "destination": "/developers/evm/simplex/overview",
+      "permanent": true
+    },
+    {
+      "source": "/developers/evm/simplex",
+      "destination": "/developers/evm/simplex/overview",
+      "permanent": true
+    }
+  ]
+}

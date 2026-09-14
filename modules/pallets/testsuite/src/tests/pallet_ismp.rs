@@ -1,0 +1,940 @@
+// Copyright (c) 2025 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![cfg(test)]
+
+use std::{
+	collections::BTreeMap,
+	time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use codec::Encode;
+use frame_support::{
+	assert_noop,
+	traits::{
+		fungible::{Inspect, Mutate},
+		Time,
+	},
+};
+use frame_system::Origin;
+use polkadot_sdk::{sp_crypto_hashing::keccak_256, *};
+use sp_core::{crypto::AccountId32, ByteArray, Pair, H256};
+use sp_runtime::traits::AccountIdConversion;
+
+use ismp::{
+	consensus::{StateCommitment, StateMachineHeight, StateMachineId},
+	dispatcher::{DispatchGet, DispatchRequest, FeeMetadata, IsmpDispatcher},
+	host::{IsmpHost, StateMachine},
+	messaging::{hash_request, Message, Proof, RequestMessage, ResponseMessage, TimeoutMessage},
+	router::{GetResponse, PostRequest, Request},
+};
+use ismp_testsuite::{
+	check_challenge_period, check_client_expiry, check_get_timeout_message_dedup,
+	check_post_timeout_message_dedup, check_request_message_dedup, check_response_message_dedup,
+	create_relayer_signer, get_response_already_received_check, missing_state_commitment_check,
+	post_request_timeout_check, write_outgoing_commitments,
+};
+use pallet_ismp::{
+	child_trie::{RequestCommitments, RequestReceipts},
+	offchain::Leaf,
+	CommitmentQueueState, CommitmentQueueStates, FundMessageParams, MessageCommitment,
+	StateCommitmentQueue, StateMachineCommitmentCap, RELAYER_FEE_ACCOUNT,
+};
+use pallet_ismp_relayer::withdrawal::Signature;
+
+use crate::runtime::*;
+
+fn set_timestamp(now: Option<u64>) {
+	Timestamp::set_timestamp(
+		now.unwrap_or(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64),
+	);
+}
+
+#[test]
+fn dispatcher_should_write_receipts_for_outgoing_requests_and_responses() {
+	let mut ext = new_test_ext();
+
+	ext.execute_with(|| {
+		set_timestamp(Some(1));
+		let host = Ismp::default();
+		let post = PostRequest {
+			source: StateMachine::Kusama(2000),
+			dest: host.host_state_machine(),
+			nonce: 0,
+			from: vec![0u8; 32],
+			to: vec![0u8; 32],
+			timeout_timestamp: 0,
+			body: vec![0u8; 64],
+		};
+
+		let request_commitment = hash_request::<Ismp>(&Request::Post(post.clone()));
+		RequestReceipts::<Test>::insert(request_commitment, &vec![0u8; 32]);
+		write_outgoing_commitments(&host).unwrap();
+	})
+}
+
+#[test]
+fn should_reject_updates_within_challenge_period() {
+	let mut ext = new_test_ext();
+
+	ext.execute_with(|| {
+		set_timestamp(None);
+		let host = Ismp::default();
+
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 1_000_000).unwrap();
+		check_challenge_period(&host).unwrap()
+	})
+}
+
+#[test]
+fn should_reject_messages_for_frozen_state_machines() {
+	let mut ext = new_test_ext();
+
+	ext.execute_with(|| {
+		set_timestamp(None);
+		let host = Ismp::default();
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 1_000_000).unwrap();
+		missing_state_commitment_check(&host).unwrap()
+	})
+}
+
+#[test]
+fn should_reject_expired_check_clients() {
+	let mut ext = new_test_ext();
+
+	ext.execute_with(|| {
+		set_timestamp(None);
+		let host = Ismp::default();
+		host.store_unbonding_period(MOCK_CONSENSUS_STATE_ID, 1_000_000).unwrap();
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 1_000_000).unwrap();
+		check_client_expiry(&host).unwrap()
+	})
+}
+
+#[test]
+fn should_reject_duplicate_post_requests_in_request_message() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		set_timestamp(None);
+		let host = Ismp::default();
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 1_000_000).unwrap();
+		check_request_message_dedup(&host).unwrap()
+	})
+}
+
+#[test]
+fn should_reject_duplicate_get_requests_in_response_message() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		set_timestamp(None);
+		let host = Ismp::default();
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 1_000_000).unwrap();
+		check_response_message_dedup(&host).unwrap()
+	})
+}
+
+#[test]
+fn should_reject_duplicate_requests_in_post_timeout_message() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		set_timestamp(None);
+		let host = Ismp::default();
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 1_000_000).unwrap();
+		check_post_timeout_message_dedup(&host).unwrap()
+	})
+}
+
+#[test]
+fn should_reject_duplicate_requests_in_get_timeout_message() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		set_timestamp(None);
+		let host = Ismp::default();
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 1_000_000).unwrap();
+		check_get_timeout_message_dedup(&host).unwrap()
+	})
+}
+
+#[test]
+fn should_handle_post_request_timeouts_correctly() {
+	let mut ext = new_test_ext();
+
+	ext.execute_with(|| {
+		set_timestamp(Some(0));
+		let host = Ismp::default();
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 0).unwrap();
+		post_request_timeout_check(&host).unwrap()
+	})
+}
+
+#[test]
+fn should_reject_get_timeout_with_existing_response() {
+	let mut ext = new_test_ext();
+
+	ext.execute_with(|| {
+		set_timestamp(Some(0));
+		let host = Ismp::default();
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 0).unwrap();
+		get_response_already_received_check(&host).unwrap()
+	})
+}
+
+#[test]
+fn should_reject_get_timeout_batch_when_any_request_has_response() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		let host = Ismp::default();
+		setup_mock_client::<_, Test>(&host);
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 0).unwrap();
+
+		let requests = (0..2)
+			.into_iter()
+			.map(|i| {
+				host.dispatch_request(
+					DispatchRequest::Get(DispatchGet {
+						dest: StateMachine::Evm(1),
+						from: vec![0u8; 32],
+						keys: vec![vec![1u8; 32], vec![1u8; 32]],
+						context: Default::default(),
+						height: 2,
+						timeout: 1000,
+					}),
+					FeeMetadata { payer: [0u8; 32].into(), fee: Default::default() },
+				)
+				.unwrap();
+				ismp::router::GetRequest {
+					source: host.host_state_machine(),
+					dest: StateMachine::Evm(1),
+					nonce: i,
+					from: vec![0u8; 32],
+					keys: vec![vec![1u8; 32], vec![1u8; 32]],
+					height: 2,
+					context: Default::default(),
+					timeout_timestamp: Duration::from_millis(Timestamp::now()).as_secs() + 1000,
+				}
+			})
+			.collect::<Vec<_>>();
+
+		// store a response receipt for one of the requests
+		let responded = GetResponse { get: requests[1].clone(), values: Default::default() };
+		host.store_response_receipt(&responded, &vec![0u8; 32]).unwrap();
+
+		// advance past every request's timeout so each request would otherwise be timed-out
+		set_timestamp(Some(Duration::from_secs(100_000_000).as_millis() as u64));
+
+		let res = ismp::handlers::handle_incoming_message(
+			&host,
+			Message::Timeout(TimeoutMessage::Get { requests: requests.clone() }),
+		)
+		.map_err(|e| e.downcast::<ismp::Error>().unwrap());
+		assert!(matches!(res, Err(ismp::Error::GetResponseAlreadyReceived { .. })));
+
+		// the batch was rejected, so no request commitments should have been deleted
+		for get in requests {
+			let commitment = hash_request::<Ismp>(&ismp::router::Request::Get(get));
+			assert!(host.request_commitment(commitment).is_ok());
+		}
+	})
+}
+
+#[test]
+fn should_handle_get_request_timeouts_correctly() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		let host = Ismp::default();
+		setup_mock_client::<_, Test>(&host);
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 0).unwrap();
+		let requests = (0..2)
+			.into_iter()
+			.map(|i| {
+				let msg = DispatchGet {
+					dest: StateMachine::Evm(1),
+					from: vec![0u8; 32],
+					keys: vec![vec![1u8; 32], vec![1u8; 32]],
+					context: Default::default(),
+					height: 2,
+					timeout: 1000,
+				};
+
+				host.dispatch_request(
+					DispatchRequest::Get(msg),
+					FeeMetadata { payer: [0u8; 32].into(), fee: Default::default() },
+				)
+				.unwrap();
+				ismp::router::GetRequest {
+					source: host.host_state_machine(),
+					dest: StateMachine::Evm(1),
+					nonce: i,
+					from: vec![0u8; 32],
+					keys: vec![vec![1u8; 32], vec![1u8; 32]],
+					height: 2,
+					context: Default::default(),
+
+					timeout_timestamp: Duration::from_millis(Timestamp::now()).as_secs() + 1000,
+				}
+			})
+			.collect::<Vec<_>>();
+
+		let timeout_msg = TimeoutMessage::Get { requests: requests.clone() };
+
+		set_timestamp(Some(Duration::from_secs(100_000_000).as_millis() as u64));
+		pallet_ismp::Pallet::<Test>::execute(vec![Message::Timeout(timeout_msg)]).unwrap();
+		for get in requests {
+			// commitments should not be found in storage after timeout has been processed
+			let commitment = hash_request::<Ismp>(&ismp::router::Request::Get(get));
+			assert!(host.request_commitment(commitment).is_err())
+		}
+	})
+}
+
+#[test]
+fn should_handle_get_request_responses_correctly() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		let host = Ismp::default();
+		setup_mock_client::<_, Test>(&host);
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(11155111),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+		host.store_challenge_period(id, 0).unwrap();
+		let requests = (0..2)
+			.into_iter()
+			.map(|i| {
+				let msg = DispatchGet {
+					dest: StateMachine::Evm(1),
+					from: vec![0u8; 32],
+					context: Default::default(),
+
+					keys: vec![vec![1u8; 32], vec![1u8; 32]],
+					height: 3,
+					timeout: 2_000_000_000,
+				};
+
+				host.dispatch_request(
+					DispatchRequest::Get(msg),
+					FeeMetadata { payer: [0u8; 32].into(), fee: Default::default() },
+				)
+				.unwrap();
+				ismp::router::GetRequest {
+					source: host.host_state_machine(),
+					dest: StateMachine::Evm(1),
+					nonce: i,
+					from: vec![0u8; 32],
+					keys: vec![vec![1u8; 32], vec![1u8; 32]],
+					height: 3,
+					context: Default::default(),
+
+					timeout_timestamp: Duration::from_millis(Timestamp::now()).as_secs() +
+						2_000_000_000,
+				}
+			})
+			.collect::<Vec<_>>();
+
+		set_timestamp(Some(Duration::from_secs(100_000_000).as_millis() as u64));
+
+		let (signature, public_key) = create_relayer_signer(requests.encode(), &[1u8; 32]);
+		let initial_balance = 1000 * UNIT;
+		let public_key_array: [u8; 32] =
+			public_key.try_into().expect("Public key should be 32 bytes");
+		Balances::mint_into(&public_key_array.into(), initial_balance).unwrap();
+
+		let response = ResponseMessage {
+			requests: requests.clone(),
+			proof: Proof {
+				height: StateMachineHeight {
+					id: StateMachineId {
+						state_id: StateMachine::Evm(1),
+						consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+					},
+					height: 3,
+				},
+				proof: vec![],
+			},
+			signer: signature,
+		};
+
+		pallet_ismp::Pallet::<Test>::execute(vec![Message::Response(response)]).unwrap();
+
+		for get in requests {
+			let response = GetResponse { get, values: Default::default() };
+			assert!(host.response_receipt(&response).is_some())
+		}
+	})
+}
+
+#[test]
+fn test_dispatch_fees_and_refunds() {
+	let mut ext = new_test_ext();
+	let account: AccountId32 = H256::random().0.into();
+	let host = Ismp::default();
+
+	ext.execute_with(|| {
+		let msg = DispatchGet {
+			dest: StateMachine::Evm(1),
+			from: vec![0u8; 32],
+			keys: vec![vec![1u8; 32], vec![1u8; 32]],
+			context: Default::default(),
+			height: 3,
+			timeout: 2_000_000_000,
+		};
+
+		assert_eq!(Balances::balance(&account), Default::default());
+		Balances::mint_into(&account, 10 * UNIT).unwrap();
+		assert_eq!(Balances::balance(&account), 10 * UNIT);
+
+		host.dispatch_request(
+			DispatchRequest::Get(msg.clone()),
+			// lets pay 10 units
+			FeeMetadata { payer: account.clone().into(), fee: 10 * UNIT },
+		)
+		.unwrap();
+
+		// we should no longer have it
+		assert_eq!(Balances::balance(&account), Default::default());
+
+		// now pallet-ismp has it
+		assert_eq!(Balances::balance(&RELAYER_FEE_ACCOUNT.into_account_truncating()), 10 * UNIT);
+
+		// fetch directly from pallet-mmr's buffer
+		let Leaf::Request(request) = Mmr::intermediate_leaves(0).unwrap() else {
+			panic!("Leaf not found!")
+		};
+
+		// Reproduce the timeout pipeline: delete the commitment, run the
+		// module callback, then let the host settle the refund.
+		let meta = host.delete_request_commitment(&request).unwrap();
+		host.ismp_router()
+			.module_for_id(vec![])
+			.unwrap()
+			.on_timeout(request.clone())
+			.unwrap();
+		host.on_request_timeout(&request, meta).unwrap();
+
+		// money should've been refunded to the account
+		assert_eq!(Balances::balance(&account), 10 * UNIT);
+
+		// unhappy case
+		host.dispatch_request(
+			DispatchRequest::Get(msg),
+			// lets pay 10 units
+			FeeMetadata { payer: account.clone().into(), fee: 10 * UNIT },
+		)
+		.unwrap();
+
+		// we should no longer have it
+		assert_eq!(Balances::balance(&account), Default::default());
+
+		// now pallet-ismp has it
+		assert_eq!(Balances::balance(&RELAYER_FEE_ACCOUNT.into_account_truncating()), 10 * UNIT);
+
+		// Second dispatch lives at the next MMR leaf. Failing inner callback
+		// means `on_request_timeout` is never reached, so the escrow stays
+		// in place.
+		let Leaf::Request(request) = Mmr::intermediate_leaves(1).unwrap() else {
+			panic!("Leaf not found!")
+		};
+		let _meta = host.delete_request_commitment(&request).unwrap();
+		host.ismp_router()
+			.module_for_id(ERROR_MODULE_ID.to_vec())
+			.unwrap()
+			.on_timeout(request.clone())
+			.unwrap_err();
+
+		// pallet-ismp still has it
+		assert_eq!(Balances::balance(&RELAYER_FEE_ACCOUNT.into_account_truncating()), 10 * UNIT);
+	});
+}
+
+#[test]
+fn test_fund_message() {
+	let mut ext = new_test_ext();
+	let account: AccountId32 = H256::random().0.into();
+	let host = Ismp::default();
+
+	ext.execute_with(|| {
+		let msg = DispatchGet {
+			dest: StateMachine::Evm(1),
+			from: vec![0u8; 32],
+			keys: vec![vec![1u8; 32], vec![1u8; 32]],
+			context: Default::default(),
+			height: 3,
+			timeout: 2_000_000_000,
+		};
+
+		assert_eq!(Balances::balance(&account), Default::default());
+		Balances::mint_into(&account, 20 * UNIT).unwrap();
+		assert_eq!(Balances::balance(&account), 20 * UNIT);
+
+		let commitment = host
+			.dispatch_request(
+				DispatchRequest::Get(msg.clone()),
+				// lets pay 10 units
+				FeeMetadata { payer: account.clone().into(), fee: 10 * UNIT },
+			)
+			.unwrap();
+
+		// pallet-ismp now has it
+		assert_eq!(Balances::balance(&RELAYER_FEE_ACCOUNT.into_account_truncating()), 10 * UNIT);
+
+		// fund the request
+		Ismp::fund_message(
+			Origin::<Test>::Signed(account).into(),
+			FundMessageParams {
+				commitment: MessageCommitment::Request(commitment),
+				amount: 10 * UNIT,
+			},
+		)
+		.unwrap();
+
+		assert_eq!(Balances::balance(&RELAYER_FEE_ACCOUNT.into_account_truncating()), 20 * UNIT);
+
+		let metadata = RequestCommitments::<Test>::get(commitment).unwrap();
+		assert_eq!(metadata.fee.fee, 20 * UNIT);
+	});
+}
+
+// Regression test for the "Priority is too low (100 vs 100)" pool rejection:
+// consensus updates that advance no state machine (e.g. validator-set rotations
+// during sync) must each get a content-unique `provides` tag and a priority
+// above the 100 used for request batches, otherwise distinct updates collide in
+// the transaction pool and the client can never sync.
+#[test]
+fn consensus_messages_without_state_update_get_unique_provides_tags() {
+	use ismp::messaging::ConsensusMessage;
+	use polkadot_sdk::{
+		frame_support::pallet_prelude::ValidateUnsigned,
+		sp_runtime::transaction_validity::TransactionSource,
+	};
+
+	new_test_ext().execute_with(|| {
+		let host = Ismp::default();
+		setup_mock_client::<_, Test>(&host);
+
+		// Builds a consensus message whose proof carries the sentinel prefix so the
+		// mock consensus client returns no commitments (no StateMachineUpdated).
+		let make = |suffix: &[u8]| {
+			let mut consensus_proof = b"__no_state_update__".to_vec();
+			consensus_proof.extend_from_slice(suffix);
+			Message::Consensus(ConsensusMessage {
+				consensus_proof,
+				consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+				signer: vec![],
+			})
+		};
+
+		let validate = |msg: Message| {
+			let call = pallet_ismp::Call::<Test>::handle_unsigned { messages: vec![msg] };
+			<pallet_ismp::Pallet<Test> as ValidateUnsigned>::validate_unsigned(
+				TransactionSource::External,
+				&call,
+			)
+			.expect("consensus message should be a valid unsigned transaction")
+		};
+
+		let a = validate(make(b"a"));
+		let b = validate(make(b"b"));
+
+		// Distinct consensus updates must not share a `provides` tag, otherwise the
+		// second is rejected with "Priority is too low".
+		assert_ne!(a.provides, b.provides);
+
+		// Consensus messages are prioritised above request batches (priority 100).
+		assert_eq!(a.priority, 200);
+		assert_eq!(b.priority, 200);
+
+		// An identical resubmission still yields the same tag so the pool can dedupe.
+		let a_again = validate(make(b"a"));
+		assert_eq!(a.provides, a_again.provides);
+	})
+}
+
+#[test]
+fn should_charge_fee_for_request() {
+	new_test_ext().execute_with(|| {
+		let host = Ismp::default();
+		setup_mock_client::<_, Test>(&host);
+		let id = StateMachineId {
+			state_id: StateMachine::Evm(1),
+			consensus_state_id: MOCK_CONSENSUS_STATE_ID,
+		};
+
+		let signer_pair = sp_core::sr25519::Pair::from_string("//Alice", None).unwrap();
+		let signer_account: AccountId32 = signer_pair.public().into();
+		let initial_balance = 1000 * UNIT;
+		Balances::mint_into(&signer_account, initial_balance).unwrap();
+
+		let treasury_pallet_id = TreasuryAccount::get();
+		let treasury_account = treasury_pallet_id.into_account_truncating();
+		let initial_treasury_balance = Balances::balance(&treasury_account);
+
+		let post_request = PostRequest {
+			source: id.state_id,
+			dest: host.host_state_machine(),
+			nonce: 0,
+			from: vec![1; 32],
+			to: vec![2; 32],
+			timeout_timestamp: 0,
+			body: b"body".to_vec(),
+		};
+
+		let requests = vec![post_request];
+		let signed_data = keccak_256(&requests.encode());
+		let signature = signer_pair.sign(&signed_data);
+		let signature = Signature::Sr25519 {
+			public_key: signer_pair.public().to_raw_vec(),
+			signature: signature.to_raw_vec(),
+		};
+
+		let request_message = RequestMessage {
+			requests,
+			proof: Proof {
+				height: StateMachineHeight {
+					id: StateMachineId { state_id: id.state_id, consensus_state_id: *b"mock" },
+					height: 3,
+				},
+				proof: vec![],
+			},
+			signer: signature.encode(),
+		};
+
+		let message = Message::Request(request_message);
+
+		let expected_fee = 50 * UNIT;
+
+		pallet_ismp::Pallet::<Test>::handle_unsigned(RuntimeOrigin::none(), vec![message]).unwrap();
+
+		let final_signer_balance = Balances::balance(&signer_account);
+		let final_treasury_balance = Balances::balance(&treasury_account);
+
+		assert_eq!(final_signer_balance, initial_balance - expected_fee);
+		assert_eq!(final_treasury_balance, initial_treasury_balance + expected_fee);
+	});
+}
+
+
+fn queue_test_state_machine() -> StateMachineId {
+	StateMachineId { state_id: StateMachine::Evm(97), consensus_state_id: *b"mock" }
+}
+
+fn queue_test_commitment() -> StateCommitment {
+	StateCommitment { timestamp: 0, overlay_root: None, state_root: H256::random() }
+}
+
+#[test]
+fn commitment_queue_evicts_oldest_when_cap_is_reached() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		let host = Ismp::default();
+		let id = queue_test_state_machine();
+
+		pallet_ismp::Pallet::<Test>::update_commitment_caps(
+			RuntimeOrigin::root(),
+			BTreeMap::from([(id, 3)]),
+		)
+		.unwrap();
+
+		for height in 1..=5u64 {
+			let at = StateMachineHeight { id, height };
+			host.store_state_machine_commitment(at, queue_test_commitment()).unwrap();
+			host.store_state_machine_update_time(at, Duration::from_secs(height)).unwrap();
+		}
+
+		for height in 1..=2u64 {
+			let at = StateMachineHeight { id, height };
+			assert!(host.state_machine_commitment(at).is_err());
+			assert!(host.state_machine_update_time(at).is_err());
+		}
+		for height in 3..=5u64 {
+			let at = StateMachineHeight { id, height };
+			assert!(host.state_machine_commitment(at).is_ok());
+			assert!(host.state_machine_update_time(at).is_ok());
+		}
+		assert_eq!(
+			CommitmentQueueStates::<Test>::get(id),
+			CommitmentQueueState { head: 2, tail: 5 }
+		);
+	})
+}
+
+#[test]
+fn lowering_the_cap_drains_the_queue_gradually() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		let host = Ismp::default();
+		let id = queue_test_state_machine();
+		let store = |height: u64| {
+			host.store_state_machine_commitment(
+				StateMachineHeight { id, height },
+				queue_test_commitment(),
+			)
+			.unwrap();
+		};
+
+		pallet_ismp::Pallet::<Test>::update_commitment_caps(
+			RuntimeOrigin::root(),
+			BTreeMap::from([(id, 8)]),
+		)
+		.unwrap();
+		for height in 1..=8u64 {
+			store(height);
+		}
+		assert_eq!(
+			CommitmentQueueStates::<Test>::get(id),
+			CommitmentQueueState { head: 0, tail: 8 }
+		);
+
+		pallet_ismp::Pallet::<Test>::update_commitment_caps(
+			RuntimeOrigin::root(),
+			BTreeMap::from([(id, 2)]),
+		)
+		.unwrap();
+
+		// 9 live vs cap 2: only MAX_COMMITMENT_EVICTIONS_PER_INSERT entries are
+		// evicted per insertion, so the excess drains over several insertions.
+		store(9);
+		assert_eq!(
+			CommitmentQueueStates::<Test>::get(id),
+			CommitmentQueueState { head: 4, tail: 9 }
+		);
+		store(10);
+		assert_eq!(
+			CommitmentQueueStates::<Test>::get(id),
+			CommitmentQueueState { head: 8, tail: 10 }
+		);
+		store(11);
+		assert_eq!(
+			CommitmentQueueStates::<Test>::get(id),
+			CommitmentQueueState { head: 9, tail: 11 }
+		);
+		// At the cap: steady state, one eviction per insertion.
+		store(12);
+		assert_eq!(
+			CommitmentQueueStates::<Test>::get(id),
+			CommitmentQueueState { head: 10, tail: 12 }
+		);
+		assert!(host.state_machine_commitment(StateMachineHeight { id, height: 10 }).is_err());
+		assert!(host.state_machine_commitment(StateMachineHeight { id, height: 11 }).is_ok());
+		assert!(host.state_machine_commitment(StateMachineHeight { id, height: 12 }).is_ok());
+	})
+}
+
+// A height below the latest can never be resubmitted — the consensus handler skips
+// anything at or below `previous_latest_height` — so its stale queue entry has no
+// live twin and evicting it touches nothing.
+#[test]
+fn vetoed_height_that_cannot_be_resubmitted_evicts_as_a_noop() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		let host = Ismp::default();
+		let id = queue_test_state_machine();
+		let store = |height: u64| {
+			host.store_state_machine_commitment(
+				StateMachineHeight { id, height },
+				queue_test_commitment(),
+			)
+			.unwrap();
+			host.store_latest_commitment_height(StateMachineHeight { id, height }).unwrap();
+		};
+
+		pallet_ismp::Pallet::<Test>::update_commitment_caps(
+			RuntimeOrigin::root(),
+			BTreeMap::from([(id, 2)]),
+		)
+		.unwrap();
+
+		store(10);
+		store(11);
+
+		// Veto a height below the latest: the commitment goes away immediately while
+		// its queue entry stays behind as a stale index. The latest height is
+		// untouched, so 10 stays permanently unsubmittable.
+		host.delete_state_commitment(StateMachineHeight { id, height: 10 }).unwrap();
+		assert!(host.state_machine_commitment(StateMachineHeight { id, height: 10 }).is_err());
+		assert_eq!(host.latest_commitment_height(id).unwrap(), 11);
+		assert_eq!(
+			CommitmentQueueStates::<Test>::get(id),
+			CommitmentQueueState { head: 0, tail: 2 }
+		);
+		assert_eq!(StateCommitmentQueue::<Test>::get(id, 0), Some(10));
+
+		// The stale index is evicted as a no-op on the next insertion.
+		store(12);
+		assert_eq!(
+			CommitmentQueueStates::<Test>::get(id),
+			CommitmentQueueState { head: 1, tail: 3 }
+		);
+		assert!(StateCommitmentQueue::<Test>::get(id, 0).is_none());
+		assert!(host.state_machine_commitment(StateMachineHeight { id, height: 11 }).is_ok());
+		assert!(host.state_machine_commitment(StateMachineHeight { id, height: 12 }).is_ok());
+	})
+}
+
+// Vetoing the *latest* height resets the latest pointer, which re-opens that height
+// for honest resubmission. The resubmission gets a second queue entry, and the stale
+// twin ahead of it evicts the live commitment one insertion early. This pins that
+// wart: it costs the height one insertion of retention and burns one queue slot,
+// which is negligible against the configured caps but is not a no-op.
+#[test]
+fn vetoed_latest_height_that_is_resubmitted_evicts_one_insertion_early() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		let host = Ismp::default();
+		let id = queue_test_state_machine();
+		let store = |height: u64| {
+			host.store_state_machine_commitment(
+				StateMachineHeight { id, height },
+				queue_test_commitment(),
+			)
+			.unwrap();
+			host.store_latest_commitment_height(StateMachineHeight { id, height }).unwrap();
+		};
+
+		pallet_ismp::Pallet::<Test>::update_commitment_caps(
+			RuntimeOrigin::root(),
+			BTreeMap::from([(id, 2)]),
+		)
+		.unwrap();
+
+		store(10);
+		store(11);
+
+		// Vetoing the latest height rolls the latest pointer back to 10, so the
+		// consensus handler would accept 11 again: it is not below the latest and
+		// its commitment is now absent.
+		host.delete_state_commitment(StateMachineHeight { id, height: 11 }).unwrap();
+		assert_eq!(host.latest_commitment_height(id).unwrap(), 10);
+
+		store(11);
+		assert!(host.state_machine_commitment(StateMachineHeight { id, height: 11 }).is_ok());
+		// Two queue entries now point at height 11: the stale one and the live one.
+		assert_eq!(StateCommitmentQueue::<Test>::get(id, 1), Some(11));
+		assert_eq!(StateCommitmentQueue::<Test>::get(id, 2), Some(11));
+
+		// Evicting the stale entry at index 1 deletes the live commitment for 11,
+		// one insertion before the entry at index 2 would have.
+		store(12);
+		assert!(host.state_machine_commitment(StateMachineHeight { id, height: 11 }).is_err());
+		assert!(host.state_machine_commitment(StateMachineHeight { id, height: 12 }).is_ok());
+		// The queue still counts index 2 as live, so the burnt slot leaves this
+		// chain retaining one fewer commitment than its cap of 2.
+		assert_eq!(
+			CommitmentQueueStates::<Test>::get(id),
+			CommitmentQueueState { head: 2, tail: 4 }
+		);
+		assert_eq!(StateCommitmentQueue::<Test>::get(id, 2), Some(11));
+	})
+}
+
+#[test]
+fn update_commitment_caps_checks_origin_and_rejects_zero() {
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		let id = queue_test_state_machine();
+
+		assert_noop!(
+			pallet_ismp::Pallet::<Test>::update_commitment_caps(
+				RuntimeOrigin::signed(AccountId32::new([0u8; 32])),
+				BTreeMap::from([(id, 5)]),
+			),
+			sp_runtime::DispatchError::BadOrigin,
+		);
+
+		assert_noop!(
+			pallet_ismp::Pallet::<Test>::update_commitment_caps(
+				RuntimeOrigin::root(),
+				BTreeMap::from([(id, 0)]),
+			),
+			pallet_ismp::Error::<Test>::InvalidCommitmentCap,
+		);
+
+		pallet_ismp::Pallet::<Test>::update_commitment_caps(
+			RuntimeOrigin::root(),
+			BTreeMap::from([(id, 192_000)]),
+		)
+		.unwrap();
+		assert_eq!(StateMachineCommitmentCap::<Test>::get(id), Some(192_000));
+	})
+}
+
+#[test]
+fn seed_commitment_caps_migration_sets_caps_without_clobbering_overrides() {
+	use frame_support::traits::OnRuntimeUpgrade;
+
+	let bsc = StateMachineId { state_id: StateMachine::Evm(56), consensus_state_id: *b"BSC0" };
+	let polygon = StateMachineId { state_id: StateMachine::Evm(137), consensus_state_id: *b"POLY" };
+
+	let mut ext = new_test_ext();
+	ext.execute_with(|| {
+		pallet_ismp::migrations::SeedCommitmentCaps::<Test>::on_runtime_upgrade();
+		// Six hours of blocks at each chain's cadence: 450ms for BSC, 2s for Polygon.
+		assert_eq!(StateMachineCommitmentCap::<Test>::get(bsc), Some(48_000));
+		assert_eq!(StateMachineCommitmentCap::<Test>::get(polygon), Some(10_800));
+
+		// A cap set by governance survives the migration re-running.
+		pallet_ismp::Pallet::<Test>::update_commitment_caps(
+			RuntimeOrigin::root(),
+			BTreeMap::from([(bsc, 300_000)]),
+		)
+		.unwrap();
+		pallet_ismp::migrations::SeedCommitmentCaps::<Test>::on_runtime_upgrade();
+		assert_eq!(StateMachineCommitmentCap::<Test>::get(bsc), Some(300_000));
+		assert_eq!(StateMachineCommitmentCap::<Test>::get(polygon), Some(10_800));
+	})
+}

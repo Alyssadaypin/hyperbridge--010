@@ -1,0 +1,16 @@
+{
+    "title": "EVM",
+    "pages": [
+        "overview",
+        "messaging",
+        "hyper-fungible-token",
+        "intent-gateway",
+        "simplex",
+        "streaming-yield-vault",
+        "bandwidth",
+        "lz-endpoint",
+        "contract-addresses",
+        "api"
+    ],
+    "defaultOpen": false
+}

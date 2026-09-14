@@ -1,0 +1,460 @@
+// Copyright (C) Polytope Labs Ltd.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::{
+	alloc::{boxed::Box, string::ToString},
+	weights, AccountId, Assets, Balance, Balances, Fishermen, Ismp, IsmpParachain, Mmr,
+	ParachainInfo, ReputationAsset, Runtime, RuntimeEvent, Timestamp, TreasuryAccount,
+	TreasuryPalletId, EXISTENTIAL_DEPOSIT,
+};
+use anyhow::anyhow;
+use evm_state_machine::SubstrateEvmStateMachine;
+use frame_support::{
+	pallet_prelude::{ConstU32, Get},
+	parameter_types,
+	traits::AsEnsureOriginWithArg,
+};
+use frame_system::{EnsureRoot, EnsureRootWithSuccess};
+use ismp::{
+	consensus::StateMachineClient,
+	error::Error,
+	host::StateMachine,
+	module::IsmpModule,
+	router::{GetResponse, IsmpRouter, PostRequest, Request},
+};
+use ismp_sync_committee::constants::{gnosis, mainnet::Mainnet};
+#[cfg(feature = "runtime-benchmarks")]
+use pallet_assets::BenchmarkHelper;
+use pallet_ismp::{dispatcher::FeeMetadata, ModuleId};
+use polkadot_sdk::*;
+use sp_core::{crypto::AccountId32, H256};
+use sp_runtime::Weight;
+use sp_std::prelude::*;
+#[cfg(feature = "runtime-benchmarks")]
+use staging_xcm::latest::Location;
+use substrate_state_machine::SubstrateStateMachine;
+
+/// Deprecated TokenGateway contract addresses whose incoming ISMP Post requests
+/// must be rejected unconditionally by the nexus runtime.
+/// Any [`PostRequest`] whose `from` field matches any of these 20-byte addresses
+/// is rejected in [`ProxyModule::on_accept`] before any other processing — the
+/// message is neither dispatched locally nor forwarded onwards.
+pub const DEPRECATED_TOKEN_GATEWAY_ADDRESSES: &[[u8; 20]] = &[
+	// Ethereum / Arbitrum / Optimism / Base / BSC / Gnosis TokenGateway
+	hex_literal::hex!("Fd413e3AFe560182C4471F4d143A96d3e259B6dE"),
+	// Polygon / Unichain TokenGateway
+	hex_literal::hex!("8b536105b6Fae2aE9199f5146D3C57Dfe53b614E"),
+	// Soneium TokenGateway
+	hex_literal::hex!("Ce304770236f39F9911BfCC51afBdfF3b8635718"),
+];
+
+/// Returns `true` if `from` is exactly one of the deprecated TokenGateway
+/// contract addresses in [`DEPRECATED_TOKEN_GATEWAY_ADDRESSES`].
+fn is_deprecated_token_gateway(from: &[u8]) -> bool {
+	DEPRECATED_TOKEN_GATEWAY_ADDRESSES.iter().any(|deprecated| deprecated == from)
+}
+
+#[derive(Default)]
+pub struct ProxyModule;
+
+pub struct HostStateMachine;
+
+impl Get<StateMachine> for HostStateMachine {
+	fn get() -> StateMachine {
+		StateMachine::Polkadot(ParachainInfo::get().into())
+	}
+}
+
+pub type Ethereum = ismp_sync_committee::pallet::Instance1;
+pub type Gnosis = ismp_sync_committee::pallet::Instance2;
+
+impl ismp_sync_committee::pallet::Config<Ethereum> for Runtime {
+	type AdminOrigin = EnsureRoot<AccountId>;
+	type IsmpHost = Ismp;
+}
+
+impl ismp_sync_committee::pallet::Config<Gnosis> for Runtime {
+	type AdminOrigin = EnsureRoot<AccountId>;
+	type IsmpHost = Ismp;
+}
+
+impl ismp_bsc::pallet::Config for Runtime {
+	type AdminOrigin = EnsureRoot<AccountId>;
+
+	type IsmpHost = Ismp;
+}
+
+impl pallet_state_coprocessor::Config for Runtime {
+	type IsmpHost = Ismp;
+	type Mmr = Mmr;
+	type BandwidthGate = pallet_bandwidth::Pallet<Runtime>;
+}
+
+pub struct Coprocessor;
+
+impl Get<Option<StateMachine>> for Coprocessor {
+	fn get() -> Option<StateMachine> {
+		Some(HostStateMachine::get())
+	}
+}
+
+impl ismp_grandpa::Config for Runtime {
+	type IsmpHost = pallet_ismp::Pallet<Runtime>;
+	type WeightInfo = weights::ismp_grandpa::WeightInfo<Runtime>;
+	type RootOrigin = EnsureRoot<AccountId>;
+}
+
+pub struct ParachainStateMachineProvider;
+
+impl ismp_parachain::ParachainStateMachineProvider<Runtime> for ParachainStateMachineProvider {
+	fn state_machine(id: StateMachine) -> Result<Box<dyn StateMachineClient>, Error> {
+		match id {
+			StateMachine::Evm(chain_id)
+				if chain_id == ismp_parachain::ASSET_HUB_MAINNET_CHAIN_ID =>
+				Ok(Box::new(SubstrateEvmStateMachine::<Ismp, Runtime>::default())),
+			_ => Ok(Box::new(SubstrateStateMachine::<Runtime>::from(id))),
+		}
+	}
+}
+
+impl pallet_ismp::Config for Runtime {
+	type AdminOrigin = EnsureRoot<AccountId>;
+	type HostStateMachine = HostStateMachine;
+	type TimestampProvider = Timestamp;
+	type Router = Router;
+	type Balance = Balance;
+	type Currency = Balances;
+	type Coprocessor = Coprocessor;
+	type ConsensusClients = (
+		ismp_bsc::BscClient<Ismp, Runtime, ismp_bsc::Mainnet>,
+		ismp_sync_committee::SyncCommitteeConsensusClient<Ismp, Mainnet, Runtime, Ethereum>,
+		ismp_sync_committee::SyncCommitteeConsensusClient<Ismp, gnosis::Mainnet, Runtime, Gnosis>,
+		ismp_parachain::ParachainConsensusClient<
+			Runtime,
+			IsmpParachain,
+			ParachainStateMachineProvider,
+		>,
+		ismp_grandpa::consensus::GrandpaConsensusClient<Runtime>,
+		ismp_arbitrum::ArbitrumConsensusClient<Ismp, Runtime>,
+		ismp_optimism::OptimismConsensusClient<Ismp, Runtime>,
+		ismp_polygon::PolygonClient<Ismp, Runtime>,
+		ismp_tendermint::TendermintClient<Ismp, Runtime>,
+		ismp_pharos::PharosClient<Ismp, Runtime, ismp_pharos::Mainnet>,
+		ismp_beefy::BeefyConsensusClient<Ismp, Runtime>,
+	);
+	type OffchainDB = Mmr;
+	type FeeHandler = (
+		pallet_consensus_incentives::Pallet<Runtime>,
+		pallet_messaging_incentives::Pallet<Runtime>,
+	);
+}
+
+impl pallet_ismp_relayer::Config for Runtime {
+	type IsmpHost = Ismp;
+	type RelayerOrigin = EnsureRoot<AccountId>;
+	type TreasuryPalletId = TreasuryPalletId;
+}
+
+impl pallet_ismp_host_executive::Config for Runtime {
+	type IsmpHost = Ismp;
+	type HostExecutiveOrigin = EnsureRoot<AccountId>;
+}
+
+impl pallet_call_decompressor::Config for Runtime {
+	type MaxCallSize = ConstU32<3>;
+	type WeightInfo = crate::weights::pallet_call_decompressor::WeightInfo<Runtime>;
+}
+
+/// True when the account is in the active collator set for the current
+/// session. The set comes from `pallet_session::Validators<Runtime>`,
+/// which `pallet-collator-manager`'s `SessionManager::new_session`
+/// populates with controller accounts. Registered but idle controllers
+/// and rotated out ex collators cannot sign vetoes; only the validators
+/// producing blocks for the current session can.
+pub struct IsCollator;
+impl frame_support::traits::Contains<AccountId> for IsCollator {
+	fn contains(account: &AccountId) -> bool {
+		pallet_session::Validators::<Runtime>::get().contains(account)
+	}
+}
+
+impl pallet_fishermen::Config for Runtime {
+	type IsmpHost = Ismp;
+	type IsCollator = IsCollator;
+}
+
+impl ismp_parachain::Config for Runtime {
+	type IsmpHost = Ismp;
+	type WeightInfo = weights::ismp_parachain::WeightInfo<Runtime>;
+	type RootOrigin = EnsureRoot<AccountId>;
+}
+
+impl ismp_beefy::BeefyClientConfig for Runtime {
+	fn is_parachain_tracked(para_id: u32) -> bool {
+		para_id == u32::from(ParachainInfo::get())
+	}
+
+	fn sp1_vkey_hash() -> sp_core::H256 {
+		pallet_beefy_consensus_proofs::Sp1VkeyHash::<Runtime>::get()
+	}
+
+	fn allowed_proof_types() -> &'static [u8] {
+		// Mainnet: only accept SP1 ZK proofs.
+		&[ismp_beefy::PROOF_TYPE_SP1]
+	}
+}
+
+impl pallet_consensus_incentives::Config for Runtime {
+	type IsmpHost = Ismp;
+	type TreasuryAccount = TreasuryPalletId;
+	type IncentivesOrigin = EnsureRoot<AccountId>;
+	type ReputationAsset = ReputationAsset;
+	type WeightInfo = ();
+}
+
+impl ismp_arbitrum::pallet::Config for Runtime {
+	type AdminOrigin = EnsureRoot<AccountId>;
+
+	type IsmpHost = Ismp;
+	type FishermanBlacklist = Fishermen;
+}
+
+impl ismp_optimism::pallet::Config for Runtime {
+	type AdminOrigin = EnsureRoot<AccountId>;
+
+	type IsmpHost = Ismp;
+	type FishermanBlacklist = Fishermen;
+}
+
+impl ismp_tendermint::pallet::Config for Runtime {
+	type AdminOrigin = EnsureRoot<AccountId>;
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+pub struct XcmBenchmarkHelper;
+#[cfg(feature = "runtime-benchmarks")]
+impl BenchmarkHelper<H256, ()> for XcmBenchmarkHelper {
+	fn create_asset_id_parameter(id: u32) -> H256 {
+		use codec::Encode;
+		use staging_xcm::v5::Junction::Parachain;
+		sp_io::hashing::keccak_256(&Location::new(1, Parachain(id)).encode()).into()
+	}
+
+	fn create_reserve_id_parameter(_id: u32) -> () {
+		()
+	}
+}
+
+parameter_types! {
+	pub const AssetDeposit: Balance = EXISTENTIAL_DEPOSIT;
+	pub const AssetAccountDeposit: Balance = EXISTENTIAL_DEPOSIT * 2;
+	pub const MetadataDepositBase: Balance = EXISTENTIAL_DEPOSIT * 2;
+	pub const MetadataDepositPerByte: Balance = EXISTENTIAL_DEPOSIT / 2;
+	pub const ApprovalDeposit: Balance = EXISTENTIAL_DEPOSIT * 2;
+}
+
+impl pallet_assets::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type Balance = Balance;
+	type AssetId = H256;
+	type AssetIdParameter = H256;
+	type Currency = Balances;
+	type CreateOrigin = AsEnsureOriginWithArg<EnsureRootWithSuccess<AccountId32, TreasuryAccount>>;
+	type ForceOrigin = EnsureRoot<AccountId32>;
+	type AssetDeposit = AssetDeposit;
+	type AssetAccountDeposit = AssetAccountDeposit;
+	type MetadataDepositBase = MetadataDepositBase;
+	type MetadataDepositPerByte = MetadataDepositPerByte;
+	type ApprovalDeposit = ApprovalDeposit;
+	type StringLimit = ConstU32<50>;
+	type Freezer = ();
+	type WeightInfo = weights::pallet_assets::WeightInfo<Runtime>;
+	type CallbackHandle = ();
+	type Extra = ();
+	type RemoveItemsLimit = ConstU32<5>;
+	type Holder = ();
+	type ReserveData = ();
+	#[cfg(feature = "runtime-benchmarks")]
+	type BenchmarkHelper = XcmBenchmarkHelper;
+}
+
+impl pallet_bandwidth::Config for Runtime {
+	type Dispatcher = Ismp;
+}
+
+parameter_types! {
+	// The native token's decimal count, `UNIT` is 10^12.
+	pub const HftDecimals: u8 = 12;
+}
+
+pub struct HftNativeAssetId;
+
+impl Get<H256> for HftNativeAssetId {
+	fn get() -> H256 {
+		sp_io::hashing::keccak_256(b"BRIDGE").into()
+	}
+}
+
+impl pallet_hyper_fungible_token::Config for Runtime {
+	type Dispatcher = Ismp;
+	type Assets = Assets;
+	type NativeCurrency = Balances;
+	type NativeAssetId = HftNativeAssetId;
+	type CreateOrigin = EnsureRoot<AccountId>;
+	type Decimals = HftDecimals;
+	type EvmToSubstrate = ();
+	type WeightInfo = crate::weights::pallet_hyper_fungible_token::WeightInfo<Runtime>;
+	#[cfg(feature = "runtime-benchmarks")]
+	type BenchmarkHelper = HftBenchmarkHelper;
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+pub struct HftBenchmarkHelper;
+
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_hyper_fungible_token::types::BenchmarkHelper<Runtime> for HftBenchmarkHelper {
+	fn create_asset(decimals: u8, who: &AccountId, amount: u128) -> H256 {
+		use frame_support::traits::fungibles::{metadata::Mutate as MutateMetadata, Create, Mutate};
+
+		let asset_id: H256 = sp_io::hashing::keccak_256(b"HFT_BENCHMARK_ASSET").into();
+		<Assets as Create<AccountId>>::create(asset_id, who.clone(), true, 1)
+			.expect("benchmark asset can be created");
+		<Assets as MutateMetadata<AccountId>>::set(
+			asset_id,
+			who,
+			b"HFT".to_vec(),
+			b"HFT".to_vec(),
+			decimals,
+		)
+		.expect("benchmark asset metadata can be set");
+		<Assets as Mutate<AccountId>>::mint_into(asset_id, who, amount)
+			.expect("benchmark asset can be minted");
+
+		asset_id
+	}
+}
+
+parameter_types! {
+	pub const IntentsStorageDepositFee: Balance = EXISTENTIAL_DEPOSIT * 10;
+	pub const IntentsPhantomOrderBidWindow: u32 = 25;
+}
+
+impl pallet_intents_coprocessor::Config for Runtime {
+	type Dispatcher = Ismp;
+	type Currency = Balances;
+	type StorageDepositFee = IntentsStorageDepositFee;
+	type PhantomOrderBidWindowBlocks = IntentsPhantomOrderBidWindow;
+	type GovernanceOrigin = EnsureRoot<AccountId>;
+	type WeightInfo = weights::pallet_intents_coprocessor::WeightInfo<Runtime>;
+}
+impl IsmpModule for ProxyModule {
+	fn on_accept(&self, request: PostRequest) -> Result<Weight, anyhow::Error> {
+		// Permanently reject any request originating from a deprecated TokenGateway
+		// deployment, regardless of destination. This short-circuits both the
+		// forwarding path (dest != host) and the locally-dispatched path below.
+		if is_deprecated_token_gateway(&request.from) {
+			return Err(anyhow!(
+				"rejecting request from deprecated TokenGateway address {:?} on {:?}",
+				request.from,
+				request.source,
+			));
+		}
+
+		// Bandwidth gate. Always-enforce; skipped for purchase messages so the
+		// recharge flow itself doesn't need bandwidth.
+		if !pallet_bandwidth::Pallet::<Runtime>::is_purchase_message(&request) {
+			let bytes = ismp::abi::encode_post_request(&request).len() as u32;
+			<pallet_bandwidth::Pallet<Runtime> as pallet_bandwidth::BandwidthGate>::try_consume(
+				&request.source,
+				&request.from,
+				bytes,
+			)
+			.map_err(|err| {
+				anyhow!(
+					"bandwidth gate: {err} (source={:?}, from={:x?})",
+					request.source,
+					request.from
+				)
+			})?;
+		}
+
+		if request.dest != HostStateMachine::get() {
+			Ismp::dispatch_request(
+				Request::Post(request),
+				FeeMetadata::<Runtime> { payer: [0u8; 32].into(), fee: Default::default() },
+			)?;
+			return Ok(Weight::from_parts(0, 0));
+		}
+
+		let pallet_id =
+			ModuleId::from_bytes(&request.to).map_err(|err| Error::Custom(err.to_string()))?;
+
+		match pallet_id {
+			id if id == ModuleId::Pallet(pallet_bandwidth::pallet::PALLET_BANDWIDTH) =>
+				pallet_bandwidth::Pallet::<Runtime>::default().on_accept(request),
+			pallet_hyper_fungible_token::PALLET_ID =>
+				pallet_hyper_fungible_token::Pallet::<Runtime>::default().on_accept(request),
+			_ => Err(anyhow!("Destination module not found")),
+		}
+	}
+
+	fn on_response(&self, response: GetResponse) -> Result<Weight, anyhow::Error> {
+		if response.dest_chain() != HostStateMachine::get() {
+			return Ok(Weight::from_parts(0, 0));
+		}
+
+		Err(anyhow!("Destination module not found"))
+	}
+
+	fn on_timeout(&self, timeout: Request) -> Result<Weight, anyhow::Error> {
+		// Permanently reject Post-request timeouts whose originating module is a
+		// deprecated TokenGateway deployment, before any other handling runs. Only
+		// Post requests are subject to this — Get requests and Response timeouts
+		// are untouched.
+		if let Request::Post(post) = &timeout {
+			if is_deprecated_token_gateway(&post.from) {
+				return Err(anyhow!(
+					"rejecting Post-request timeout from deprecated TokenGateway address {:?}",
+					post.from,
+				));
+			}
+		}
+
+		let (from, source) = match &timeout {
+			Request::Post(post) => (&post.from, post.source.clone()),
+			Request::Get(get) => (&get.from, get.source.clone()),
+		};
+
+		if source != HostStateMachine::get() {
+			return Ok(Weight::from_parts(0, 0));
+		}
+
+		let pallet_id = ModuleId::from_bytes(from).map_err(|err| Error::Custom(err.to_string()))?;
+		match pallet_id {
+			pallet_hyper_fungible_token::PALLET_ID =>
+				pallet_hyper_fungible_token::Pallet::<Runtime>::default().on_timeout(timeout),
+			_ => Ok(Weight::from_parts(300_000_000, 0)),
+		}
+	}
+}
+
+#[derive(Default)]
+pub struct Router;
+
+impl IsmpRouter for Router {
+	fn module_for_id(&self, _bytes: Vec<u8>) -> Result<Box<dyn IsmpModule>, anyhow::Error> {
+		Ok(Box::new(ProxyModule::default()))
+	}
+}

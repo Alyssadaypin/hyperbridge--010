@@ -1,0 +1,115 @@
+// Copyright (C) 2023 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/// Log/tracing target for this crate.
+pub const LOG_TARGET: &str = "consensus-beefy";
+
+use anyhow::anyhow;
+use primitive_types::H256;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use subxt::{
+	config::{substrate::SubstrateExtrinsicParams, ExtrinsicParams, HashFor},
+	tx::DefaultParams,
+	utils::{AccountId32, MultiSignature},
+};
+use tesseract_primitives::IsmpProvider as _;
+
+pub use beefy_verifier_primitives::ConsensusState;
+use host::{BeefyHost, BeefyHostConfig};
+use ismp::host::StateMachine;
+use prover::{Prover, ProverConfig};
+use tesseract_substrate::{SubstrateClient, SubstrateConfig};
+
+pub mod backend;
+pub mod host;
+pub mod prover;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeefyConfig {
+	// Configuration options for the BEEFY prover
+	#[serde(flatten)]
+	pub prover: ProverConfig,
+	/// Configuration options for the beefy host
+	#[serde(flatten)]
+	pub host: BeefyHostConfig,
+	/// Configuration options for the prover (state machines and finalization)
+	#[serde(flatten)]
+	pub prover_config: prover::BeefyProverConfig,
+	/// substrate config
+	#[serde(flatten)]
+	pub substrate: SubstrateConfig,
+}
+
+impl BeefyConfig {
+	/// Constructs an instance of the [`IsmpHost`], selecting the proof backend based on
+	/// [`BeefyProverConfig::backend`](prover::BeefyProverConfig::backend).
+	pub async fn into_client<R, P>(
+		self,
+	) -> Result<BeefyHost<R, P, zk_beefy::LocalProver, dyn backend::ProofBackend>, anyhow::Error>
+	where
+		R: subxt::Config + Send + Sync + Clone,
+		P: subxt::Config<ExtrinsicParams = SubstrateExtrinsicParams<P>> + Send + Sync + Clone,
+		<P::ExtrinsicParams as ExtrinsicParams<P>>::Params: Send + Sync + DefaultParams,
+		P::Signature: From<MultiSignature> + Send + Sync,
+		P::AccountId: From<AccountId32> + Into<P::Address> + Clone + 'static + Send + Sync,
+		H256: From<HashFor<P>>,
+	{
+		let client = SubstrateClient::<P>::new(self.substrate).await?;
+		// The SP1 nonce must equal the account that signs `submit_proof`, which is this client's
+		// signer. Commit it into every proof so the pallet's `nonce == signer` check passes.
+		// `SubstrateClient::address` is the signer's 32-byte sr25519 public key.
+		let account: H256 = <[u8; 32]>::try_from(client.address.as_slice())
+			.map_err(|_| anyhow!("beefy submission signer account must be 32 bytes"))?
+			.into();
+		let prover =
+			Prover::<R, P, zk_beefy::LocalProver>::new(self.prover.clone(), account).await?;
+
+		let backend: Arc<dyn backend::ProofBackend> = match self.prover_config.backend.clone() {
+			backend::ProofBackendConfig::Redis { config } => {
+				let mut cfg = config;
+				cfg.realtime = true; // Enable real-time notifications
+				Arc::new(backend::RedisProofBackend::new(cfg).await?)
+			},
+			backend::ProofBackendConfig::Onchain => {
+				let mut sm_id = client.state_machine_id();
+				sm_id.consensus_state_id = self.host.consensus_state_id;
+				Arc::new(backend::OnchainBackend::<P>::new(
+					client.client.clone(),
+					client.rpc_client.clone(),
+					client.signer.clone(),
+					sm_id,
+				))
+			},
+			backend::ProofBackendConfig::InMemory => {
+				let initial_state = prover.query_initial_consensus_state(None).await?;
+				Arc::new(backend::InMemoryProofBackend::new(initial_state))
+			},
+		};
+
+		BeefyHost::<R, P, zk_beefy::LocalProver, dyn backend::ProofBackend>::new(
+			self.host, prover, client, backend,
+		)
+		.await
+	}
+}
+
+pub(crate) fn extract_para_id(state_machine: StateMachine) -> Result<u32, anyhow::Error> {
+	let para_id = match state_machine {
+		StateMachine::Polkadot(id) | StateMachine::Kusama(id) => id,
+		_ => Err(anyhow!("Invalid state machine: {state_machine}"))?,
+	};
+
+	Ok(para_id)
+}

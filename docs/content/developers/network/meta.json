@@ -1,0 +1,9 @@
+{
+  "title": "Network",
+  "pages": [
+    "node",
+    "collator",
+    "relayer",
+    "prover"
+  ]
+}

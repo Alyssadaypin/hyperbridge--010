@@ -1,0 +1,68 @@
+[package]
+name = "tesseract-beefy"
+version = "0.1.0"
+edition = "2021"
+description = "BEEFY client implementation for the tesseract relayer"
+authors = ["Polytope Labs <hello@polytope.technology>"]
+
+[dependencies]
+# crates.io
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+anyhow = "1.0.75"
+subxt = { workspace = true }
+codec = { package = "parity-scale-codec", version = "3.2.2", features = ["derive"] }
+futures = "0.3.28"
+async-trait = "0.1.53"
+async-stream = "0.3"
+tokio = { workspace = true, features = ["full", "sync"] }
+finality-grandpa = "0.16.2"
+log = "0.4.20"
+hex = { workspace = true }
+hex-literal = "0.4.1"
+sp-core = { workspace = true, features = ["full_crypto"] }
+alloy-sol-types = { workspace = true }
+alloy-primitives = { workspace = true }
+derive_more = { version = "1.0.0-beta.6", features = ["display"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+redis = { version = "0.24.0", features = ["connection-manager", "tokio-rustls-comp"] }
+bytes = "1.6.0"
+primitive-types = { workspace = true }
+
+# polytope-labs
+pallet-ismp = { workspace = true }
+pallet-ismp-rpc = { workspace = true }
+pallet-beefy-consensus-proofs = { workspace = true }
+ismp = { workspace = true }
+ismp-beefy = { workspace = true }
+ismp-abi = { workspace = true, features = ["substrate"] }
+substrate-state-machine = { workspace = true }
+beefy-verifier-primitives = { workspace = true }
+beefy-prover = { workspace = true }
+subxt-utils = { workspace = true }
+
+# substrate
+sp-consensus-beefy = { workspace = true }
+# tesseract
+tesseract-substrate = { workspace = true  }
+tesseract-primitives = { workspace = true  }
+zk-beefy = { path = "zk" }
+rsmq_async = { workspace = true }
+redis-async = { version = "0.17.1", features = ["with-rustls"] }
+
+[dependencies.polkadot-sdk]
+workspace = true
+features = ["sp-runtime"]
+
+[features]
+# a feature that tells the tests to write a new consensus state
+new-consensus-state = []
+
+[dev-dependencies]
+# crates.io
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+dotenv = { workspace = true }
+anyhow = "1.0.75"
+hex = { workspace = true }
+tokio = { workspace = true, features = ["full", "sync"] }
+alloy = { workspace = true, features = ["provider-http", "rpc-types", "contract", "signer-local", "network", "providers", "transports", "reqwest", "reqwest-default-tls"] }

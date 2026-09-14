@@ -1,0 +1,7 @@
+@hyperbridge/core/=node_modules/@hyperbridge/core/contracts/
+@openzeppelin/=node_modules/@openzeppelin/
+@polytope-labs/=node_modules/@polytope-labs/
+@uniswap/=node_modules/@uniswap/
+stringutils/=lib/solidity-stringutils/src/
+@sp1-contracts/=lib/sp1-contracts/contracts/src/
+forge-std/=node_modules/forge-std/src/

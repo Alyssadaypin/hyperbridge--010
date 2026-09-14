@@ -1,0 +1,1200 @@
+// Copyright (C) 2023 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! [`IsmpProvider`] implementation
+
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use anyhow::{anyhow, Error};
+use codec::{Decode, Encode};
+use futures::{stream::FuturesOrdered, FutureExt};
+use hex_literal::hex;
+use polkadot_sdk::{
+	sp_core::{
+		storage::{ChildInfo, StorageData, StorageKey},
+		Pair, H160, U256,
+	},
+	sp_io::hashing::keccak_256,
+};
+use subxt::{
+	config::{ExtrinsicParams, HashFor, Header},
+	ext::{
+		scale_value::value,
+		subxt_rpcs::{methods::legacy::DryRunResult, rpc_params},
+	},
+	tx::{DefaultParams, Payload},
+	utils::{AccountId32, MultiSignature, H256},
+};
+
+use ismp::{
+	consensus::{ConsensusClientId, StateCommitment, StateMachineHeight, StateMachineId},
+	events::{Event, StateCommitmentVetoed},
+	host::StateMachine,
+	messaging::{hash_request, CreateConsensusState, Message},
+	router::Request,
+};
+use pallet_ismp::{
+	child_trie::{request_commitment_storage_key, CHILD_TRIE_PREFIX},
+	offchain::ProofKeys,
+};
+use pallet_ismp_host_executive::HostParam;
+use pallet_ismp_relayer::withdrawal::Signature;
+use pallet_ismp_rpc::BlockNumberOrHash;
+use substrate_state_machine::StateMachineProof;
+use subxt_utils::{
+	host_params_storage_key, send_extrinsic, state_machine_commitment_storage_key,
+	state_machine_update_time_storage_key,
+	values::{messages_to_value, state_machine_height_to_value},
+};
+use tesseract_primitives::{
+	wait_for_challenge_period, BoxStream, EstimateGasReturnParams, Hasher, IsmpProvider,
+	ProofAccepted, Query, StateMachineUpdated, StateProofQueryType,
+	StorageKey as TesseractStorageKey, TxReceipt, TxResult,
+};
+
+use crate::{
+	calls::RequestMetadata,
+	extrinsic::{send_unsigned_extrinsic, system_dry_run_unsigned, InMemorySigner},
+	SubstrateClient,
+};
+
+/// SCALE-decoded prefix of `pallet_beefy_consensus_proofs::Event::ProofAccepted`'s
+/// field tuple. The trailing `rewarded` balance is intentionally not decoded —
+/// the consumer doesn't need it and skipping it keeps this decoder independent
+/// of the runtime's `Balance` type.
+#[derive(Debug, Decode)]
+struct ProofAcceptedFields {
+	_submitter: AccountId32,
+	height: u64,
+	new_set_id: Option<u64>,
+}
+
+impl<C> SubstrateClient<C>
+where
+	C: subxt::Config + Send + Sync + Clone,
+{
+	/// Construct an in-memory signer for this client's configured key. Shared by every
+	/// extrinsic-submitting trait method.
+	pub(crate) fn in_memory_signer(&self) -> InMemorySigner<C>
+	where
+		<C as subxt::Config>::AccountId: From<subxt::utils::AccountId32>,
+	{
+		let binding = self.signer.public();
+		let public_key_slice: &[u8] = binding.as_ref();
+		let public_key_array: [u8; 32] =
+			public_key_slice.try_into().expect("Public key must be 32 bytes");
+		let account_id = AccountId32::from(public_key_array);
+		InMemorySigner { account_id: account_id.into(), signer: self.signer.clone() }
+	}
+
+	/// Scans `frame_system::Events` across parachain blocks `(cursor, tip]` in
+	/// a single `state_queryStorage` call, decodes every
+	/// `pallet_beefy_consensus_proofs::Event::ProofAccepted` found, and
+	/// coalesces them: all mandatory (rotation) proofs are preserved in
+	/// ascending height order, followed by at most one messaging proof (the
+	/// newest in the window). This is the per-window body of
+	/// [`IsmpProvider::proof_accepted_notification`], extracted so tests can
+	/// exercise it against historical ranges without driving the polling loop.
+	pub async fn proof_accepted_in_range(
+		&self,
+		cursor: u64,
+		tip: u64,
+	) -> Result<Vec<ProofAccepted>, anyhow::Error> {
+		use subxt::events::Events;
+
+		let from_hash = self
+			.rpc
+			.chain_get_block_hash(Some(((cursor + 1) as u64).into()))
+			.await?
+			.ok_or_else(|| anyhow!("block {} not found", cursor + 1))?;
+		let to_hash = self
+			.rpc
+			.chain_get_block_hash(Some(tip.into()))
+			.await?
+			.ok_or_else(|| anyhow!("block {tip} not found"))?;
+
+		let events_key = system_events_key();
+		let changes = self
+			.rpc
+			.state_query_storage(vec![&events_key.0[..]], from_hash, Some(to_hash))
+			.await?;
+
+		let metadata = self.client.metadata();
+		let mut mandatory: Vec<ProofAccepted> = Vec::new();
+		let mut latest_messaging: Option<ProofAccepted> = None;
+		for change in changes {
+			let Some(events_data) = change.changes.into_iter().find_map(|(_, data)| data) else {
+				continue;
+			};
+			let events = Events::<C>::decode_from(events_data.0, metadata.clone());
+			for ev in events.iter() {
+				let ev = ev?;
+				if ev.pallet_name() != "BeefyConsensusProofs" ||
+					ev.variant_name() != "ProofAccepted"
+				{
+					continue;
+				}
+				let fields = ProofAcceptedFields::decode(&mut ev.field_bytes())?;
+				let out = ProofAccepted { height: fields.height, new_set_id: fields.new_set_id };
+				if out.new_set_id.is_some() {
+					mandatory.push(out);
+				} else if latest_messaging.as_ref().map_or(true, |cur| out.height > cur.height) {
+					latest_messaging = Some(out);
+				}
+			}
+		}
+
+		// Mandatory first, ascending — emission order must match the on-chain
+		// rotation order for consumers that apply rotations cumulatively. The
+		// coalesced latest messaging proof, if any, goes last.
+		mandatory.sort_by_key(|m| m.height);
+		if let Some(latest) = latest_messaging {
+			mandatory.push(latest);
+		}
+		Ok(mandatory)
+	}
+}
+
+#[async_trait::async_trait]
+impl<C> IsmpProvider for SubstrateClient<C>
+where
+	C: subxt::Config + Send + Sync + Clone,
+	C::Header: Send + Sync,
+	C::AccountId: From<AccountId32> + Into<C::Address> + Clone + Send + Sync,
+	C::Signature: From<MultiSignature> + Send + Sync,
+	<C::ExtrinsicParams as ExtrinsicParams<C>>::Params: Send + Sync + DefaultParams,
+	H256: From<HashFor<C>>,
+{
+	async fn query_consensus_state(
+		&self,
+		at: Option<u64>,
+		id: ConsensusClientId,
+	) -> Result<Vec<u8>, anyhow::Error> {
+		let params = rpc_params![at, id];
+		let response = self.rpc_client.request("ismp_queryConsensusState", params).await?;
+
+		Ok(response)
+	}
+
+	async fn query_latest_height(&self, id: StateMachineId) -> Result<u32, anyhow::Error> {
+		let params = rpc_params![id];
+		let response =
+			self.rpc_client.request("ismp_queryStateMachineLatestHeight", params).await?;
+
+		Ok(response)
+	}
+
+	async fn query_finalized_height(&self) -> Result<u64, anyhow::Error> {
+		let finalized = self.rpc.chain_get_finalized_head().await?;
+		let block = self
+			.rpc
+			.chain_get_header(Some(finalized))
+			.await?
+			.ok_or_else(|| anyhow!("Finalized header should exist {finalized:?}"))?;
+		Ok(block.number().into())
+	}
+
+	async fn query_storage(
+		&self,
+		key: TesseractStorageKey,
+		at: Option<u64>,
+	) -> Result<Option<Vec<u8>>, anyhow::Error> {
+		let key = match key {
+			TesseractStorageKey::Substrate(k) => k,
+			TesseractStorageKey::Evm { .. } =>
+				return Err(anyhow!("StorageKey::Evm not supported on substrate provider")),
+		};
+		let block_number = at.map(Into::into);
+		let block_hash =
+			self.rpc.chain_get_block_hash(block_number).await?.ok_or_else(|| match at {
+				Some(h) => anyhow!("No block hash found for height {h}"),
+				None => anyhow!("Failed to query latest block hash"),
+			})?;
+		let raw = self.client.storage().at(block_hash).fetch_raw(key).await?;
+		Ok(raw)
+	}
+
+	async fn query_state_machine_update_time(
+		&self,
+		height: StateMachineHeight,
+	) -> Result<Duration, anyhow::Error> {
+		let key = state_machine_update_time_storage_key(height);
+		let block_hash = self
+			.rpc
+			.chain_get_block_hash(None)
+			.await?
+			.ok_or_else(|| anyhow!("Failed to query latest block hash"))?;
+		let raw_value = self
+			.client
+			.storage()
+			.at(block_hash)
+			.fetch_raw(key.clone())
+			.await?
+			.ok_or_else(|| {
+				anyhow!("State machine update for {:?} not found at block {:?}", height, block_hash)
+			})?;
+
+		let value = Decode::decode(&mut &*raw_value)?;
+
+		Ok(Duration::from_secs(value))
+	}
+
+	async fn query_requests_proof(
+		&self,
+		at: u64,
+		keys: Vec<Query>,
+		counterparty: StateMachine,
+	) -> Result<Vec<u8>, anyhow::Error> {
+		if keys.is_empty() {
+			Err(anyhow!("No queries provided"))?
+		}
+		// We use the counterparty chain's state machine id to know what kind of proof is required
+		// Necessary for when substrate chains are using tesseract to communicate with hyperbridge
+		// The destination chain in the request does not reflect the kind of proof needed
+		match counterparty {
+			// Use mmr proofs for queries going to EVM chains
+			s if s.is_evm() => {
+				let keys =
+					ProofKeys::Requests(keys.into_iter().map(|key| key.commitment).collect());
+				let params = rpc_params![at, keys];
+				let response: pallet_ismp_rpc::Proof =
+					self.rpc_client.request("mmr_queryProof", params).await?;
+				Ok(response.proof)
+			},
+			// Use child trie proofs for queries going to substrate chains
+			s if s.is_substrate() => {
+				let keys: Vec<_> = keys
+					.into_iter()
+					.map(|key| request_commitment_storage_key(key.commitment))
+					.collect();
+				let params = rpc_params![at, keys];
+				let response: pallet_ismp_rpc::Proof =
+					self.rpc_client.request("ismp_queryChildTrieProof", params).await?;
+				let storage_proof: Vec<Vec<u8>> = Decode::decode(&mut &*response.proof)?;
+				let proof = StateMachineProof { hasher: self.hashing.clone(), storage_proof };
+				Ok(proof.encode())
+			},
+			s => Err(anyhow::anyhow!("Unsupported state machine {s:?}!")),
+		}
+	}
+
+	async fn query_responses_proof(
+		&self,
+		at: u64,
+		commitments: Vec<H256>,
+		counterparty: StateMachine,
+	) -> Result<Vec<u8>, anyhow::Error> {
+		if commitments.is_empty() {
+			Err(anyhow!("No commitments provided"))?
+		}
+		match counterparty {
+			s if s.is_evm() => {
+				let keys = ProofKeys::Responses(commitments);
+				let params = rpc_params![at, keys];
+				let response: pallet_ismp_rpc::Proof =
+					self.rpc_client.request("mmr_queryProof", params).await?;
+				Ok(response.proof)
+			},
+			s => Err(anyhow::anyhow!("query_responses_proof is unsupported for {s:?}")),
+		}
+	}
+
+	async fn query_state_proof(
+		&self,
+		at: u64,
+		keys: StateProofQueryType,
+	) -> Result<Vec<u8>, anyhow::Error> {
+		match keys {
+			StateProofQueryType::Ismp(keys) => {
+				let params = rpc_params![at, keys];
+				let response: pallet_ismp_rpc::Proof =
+					self.rpc_client.request("ismp_queryChildTrieProof", params).await?;
+				let storage_proof: Vec<Vec<u8>> = Decode::decode(&mut &*response.proof)?;
+				let proof = StateMachineProof { hasher: self.hashing.clone(), storage_proof };
+				Ok(proof.encode())
+			},
+			StateProofQueryType::Arbitrary(keys) => {
+				let params = rpc_params![at, keys];
+				let response: pallet_ismp_rpc::Proof =
+					self.rpc_client.request("ismp_queryStateProof", params).await?;
+
+				let storage_proof: Vec<Vec<u8>> = Decode::decode(&mut &*response.proof)?;
+				let proof = StateMachineProof { hasher: self.hashing.clone(), storage_proof };
+				Ok(proof.encode())
+			},
+		}
+	}
+
+	async fn query_ismp_events(
+		&self,
+		previous_height: u64,
+		event: StateMachineUpdated,
+	) -> Result<Vec<Event>, anyhow::Error> {
+		let range = (previous_height + 1)..=event.latest_height;
+		if range.is_empty() {
+			return Ok(Default::default());
+		}
+
+		let mut events = vec![];
+		let chunk_size = 100;
+		let chunks = range.end().saturating_sub(*range.start()) / chunk_size;
+		for i in 0..=chunks {
+			let start = (i * chunk_size) + *range.start();
+			let end = if i == chunks { *range.end() } else { start + chunk_size - 1 };
+			let params = rpc_params![
+				BlockNumberOrHash::<H256>::Number(start as u32),
+				BlockNumberOrHash::<H256>::Number(end as u32)
+			];
+			let response = self
+				.rpc_client
+				.request::<HashMap<String, Vec<Event>>>("ismp_queryEvents", params)
+				.await;
+			match response {
+				Ok(response) => {
+					let batch = response.values().into_iter().cloned().flatten();
+					events.extend(batch)
+				},
+				Err(err) => {
+					log::error!(
+						target: crate::LOG_TARGET, "Error while querying events in range {}..{} from {:?}: {err:?}",
+						start,
+						end,
+						self.state_machine
+					);
+				},
+			}
+		}
+
+		Ok(events)
+	}
+
+	fn name(&self) -> String {
+		format!("{:?}", self.state_machine)
+	}
+
+	fn state_machine_id(&self) -> StateMachineId {
+		StateMachineId { state_id: self.state_machine, consensus_state_id: self.consensus_state_id }
+	}
+
+	fn ismp_host_contract(&self) -> Option<H160> {
+		// Substrate hosts ISMP via a pallet, not a contract — there's no
+		// on-chain address. The outbound-consensus claim path is EVM-only
+		// and short-circuits on this `None`.
+		None
+	}
+
+	fn block_max_gas(&self) -> u64 {
+		Default::default()
+	}
+
+	fn initial_height(&self) -> u64 {
+		self.initial_height
+	}
+
+	async fn estimate_gas(
+		&self,
+		messages: Vec<ismp::messaging::Message>,
+	) -> Result<Vec<EstimateGasReturnParams>, anyhow::Error> {
+		use tokio_stream::StreamExt;
+		let batch_size = 50;
+		let mut gas_estimates = vec![];
+		for chunk in messages.chunks(batch_size) {
+			let processes: FuturesOrdered<
+				tokio::task::JoinHandle<Result<EstimateGasReturnParams, Error>>,
+			> = chunk
+				.into_iter()
+				.map(|msg| {
+					let extrinsic = subxt::dynamic::tx(
+						"Ismp",
+						"handle_unsigned",
+						vec![messages_to_value(vec![msg.clone()])],
+					);
+					let client = self.client.clone();
+					let rpc = self.rpc.clone();
+					tokio::spawn(async move {
+						let result_bytes =
+							system_dry_run_unsigned(&client, &rpc, extrinsic).await?;
+						let result = result_bytes
+							.into_dry_run_result()
+							.map_err(|_e| anyhow!("error dry running call"))?;
+						match result {
+							DryRunResult::Success => Ok::<_, Error>(EstimateGasReturnParams {
+								execution_cost: Default::default(),
+								successful_execution: true,
+							}),
+							_ => Ok(EstimateGasReturnParams {
+								execution_cost: Default::default(),
+								successful_execution: false,
+							}),
+						}
+					})
+				})
+				.collect::<FuturesOrdered<_>>();
+
+			let estimates = processes
+				.collect::<Result<Vec<_>, _>>()
+				.await?
+				.into_iter()
+				.collect::<Result<Vec<_>, _>>()?;
+
+			gas_estimates.extend(estimates);
+		}
+
+		Ok(gas_estimates)
+	}
+
+	async fn query_request_fee_metadata(&self, _hash: H256) -> Result<U256, anyhow::Error> {
+		let key = self.req_commitments_key(_hash);
+		let child_storage_key = ChildInfo::new_default(CHILD_TRIE_PREFIX).prefixed_storage_key();
+		let storage_key = StorageKey(key);
+		let params = rpc_params![child_storage_key, storage_key, Option::<HashFor<C>>::None];
+
+		let response: Option<StorageData> =
+			self.rpc_client.request("childstate_getStorage", params).await?;
+		let data = response.ok_or_else(|| anyhow!("Request fee metadata query returned None"))?;
+		let leaf_meta = RequestMetadata::decode(&mut &*data.0)?;
+		Ok(leaf_meta.meta.fee.into())
+	}
+
+	async fn query_request_receipt(&self, _hash: H256) -> Result<Vec<u8>, anyhow::Error> {
+		let key = self.req_receipts_key(_hash);
+		let child_storage_key = ChildInfo::new_default(CHILD_TRIE_PREFIX).prefixed_storage_key();
+		let storage_key = StorageKey(key);
+		let params = rpc_params![child_storage_key, storage_key, Option::<HashFor<C>>::None];
+
+		let response: Option<StorageData> =
+			self.rpc_client.request("childstate_getStorage", params).await?;
+		if let Some(data) = response {
+			let relayer = Vec::<u8>::decode(&mut &*data.0)?;
+			Ok(relayer)
+		} else {
+			Ok(H160::zero().0.to_vec())
+		}
+	}
+
+	async fn query_response_receipt(&self, _hash: H256) -> Result<Vec<u8>, anyhow::Error> {
+		let key = self.res_receipt_key(_hash);
+		let child_storage_key = ChildInfo::new_default(CHILD_TRIE_PREFIX).prefixed_storage_key();
+		let storage_key = StorageKey(key);
+		let params = rpc_params![child_storage_key, storage_key, Option::<HashFor<C>>::None];
+
+		let response: Option<StorageData> =
+			self.rpc_client.request("childstate_getStorage", params).await?;
+		if let Some(data) = response {
+			let relayer = pallet_ismp::ResponseReceipt::decode(&mut &*data.0)?.relayer;
+			Ok(relayer)
+		} else {
+			Ok(H160::zero().0.to_vec())
+		}
+	}
+
+	async fn state_commitment_vetoed_notification(
+		&self,
+		from: u64,
+		update_height: StateMachineHeight,
+	) -> BoxStream<StateCommitmentVetoed> {
+		let client = self.clone();
+		let (tx, recv) = tokio::sync::mpsc::channel(512);
+		tokio::task::spawn(async move {
+			let mut latest_height = from;
+			let state_machine = client.state_machine;
+			loop {
+				// Kill task when receiver is dropped
+				if tx.is_closed() {
+					return
+				}
+				tokio::time::sleep(Duration::from_secs(10)).await;
+				let header = match client.rpc.chain_get_header(None).await {
+					Ok(Some(header)) => header,
+					_ => {
+						if let Err(err) = tx
+							.send(Err(anyhow!(
+								"Error encountered while fething finalized head"
+							).into()))
+							.await
+						{
+							log::error!(target: crate::LOG_TARGET, "Failed to send message over channel on {state_machine:?} \n {err:?}");
+							return
+						}
+						continue;
+					},
+				};
+
+				if header.number().into() <= latest_height {
+					continue;
+				}
+
+				let event = StateMachineUpdated {
+					state_machine_id: client.state_machine_id(),
+					latest_height: header.number().into(),
+				};
+
+				let events = match client.query_ismp_events(latest_height, event).await {
+					Ok(e) => e,
+					Err(err) => {
+						if let Err(err) = tx
+							.send(Err(anyhow!(
+								"Error encountered while querying ismp events {err:?}"
+							).into()))
+							.await
+						{
+							log::error!(target: crate::LOG_TARGET, "Failed to send message over channel on {state_machine:?} \n {err:?}");
+							return
+						}
+						latest_height = header.number().into();
+						continue;
+					},
+				};
+
+				let event = events
+					.into_iter()
+					.find_map(|event| match event {
+						Event::StateCommitmentVetoed(e)
+							if e.height == update_height =>
+							Some(e),
+						_ => None,
+					});
+
+				match event {
+					Some(event) => {
+						// `try_send` so this poller never blocks on a
+						// stalled consumer of the veto stream. On
+						// `Closed` (consumer dropped) we exit the loop;
+						// on `Full` we warn and continue — the next
+						// query window will surface the same veto event.
+						match tx.try_send(Ok(event.clone())) {
+							Ok(()) => {},
+							Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+								log::warn!(
+									target: crate::LOG_TARGET,
+									"state commitment veto channel full on {state_machine:?} - {:?}; event dropped",
+									update_height.id.state_id,
+								);
+							},
+							Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+								log::trace!(
+									target: crate::LOG_TARGET,
+									"state commitment veto channel closed on {state_machine:?} - {:?}",
+									update_height.id.state_id,
+								);
+								return
+							},
+						}
+					},
+					None => {},
+				};
+
+				latest_height = header.number().into();
+			}
+		}.boxed());
+
+		Box::pin(tokio_stream::wrappers::ReceiverStream::new(recv))
+	}
+
+	async fn state_machine_update_notification(
+		&self,
+		counterparty_state_id: StateMachineId,
+	) -> Result<BoxStream<StateMachineUpdated>, anyhow::Error> {
+		use futures::StreamExt;
+		let client = self.clone();
+		let mut mutex = self.state_machine_update_sender.lock().await;
+		let is_empty = mutex.is_none();
+		let (tx, recv) = if is_empty {
+			let (tx_og, recv) = tokio::sync::broadcast::channel(512);
+			*mutex = Some(tx_og.clone());
+			(tx_og, recv)
+		} else {
+			let tx = mutex.as_ref().expect("Not empty").clone();
+			let recv = tx.subscribe();
+			(tx, recv)
+		};
+		let latest_height = client.query_finalized_height().await?;
+
+		if is_empty {
+			tokio::task::spawn(async move {
+				let mut latest_height = latest_height;
+				let state_machine = client.state_machine;
+				let poll_interval = client.config.poll_interval.unwrap_or(10);
+				loop {
+					tokio::time::sleep(Duration::from_secs(poll_interval)).await;
+					let header = match client.rpc.chain_get_finalized_head().await {
+						Ok(hash) => match client.rpc.chain_get_header(Some(hash)).await {
+							Ok(Some(header)) => header,
+							_ => {
+								if let Err(err) = tx
+									.send(Err(anyhow!(
+										"Error encountered while fetching finalized head"
+									).into()))
+								{
+									log::error!(target: crate::LOG_TARGET, "Failed to send message over channel on {state_machine:?} \n {err:?}");
+									return
+								}
+								continue;
+							},
+						},
+						Err(err) => {
+							if let Err(err) = tx
+								.send(Err(anyhow!(
+									"Error encountered while fetching finalized head: {err:?}"
+								).into()))
+							{
+								log::error!(target: crate::LOG_TARGET, "Failed to send message over channel on {state_machine:?} \n {err:?}");
+								return
+							}
+							continue;
+						},
+					};
+
+					if header.number().into() <= latest_height {
+						continue;
+					}
+
+					let event = StateMachineUpdated {
+						state_machine_id: client.state_machine_id(),
+						latest_height: header.number().into(),
+					};
+
+					let events = match client.query_ismp_events(latest_height, event).await {
+						Ok(e) => e,
+						Err(err) => {
+							if let Err(err) = tx
+								.send(Err(anyhow!(
+									"Error encountered while querying ismp events {err:?}"
+								).into()))
+							{
+								log::error!(target: crate::LOG_TARGET, "Failed to send message over channel on {state_machine:?} \n {err:?}");
+								return
+							}
+							latest_height = header.number().into();
+							continue;
+						},
+					};
+
+					let event = events
+						.into_iter()
+						.filter_map(|event| match event {
+							Event::StateMachineUpdated(e)
+								if e.state_machine_id == counterparty_state_id =>
+								Some(e),
+							_ => None,
+						})
+						.max_by(|x, y| x.latest_height.cmp(&y.latest_height));
+
+					match event {
+						Some(event) => {
+							// We wait for the challenge period and see if the update will be vetoed before yielding
+							let commitment_height = StateMachineHeight { id: counterparty_state_id, height: event.latest_height };
+							let state_machine_update_time = match client.query_state_machine_update_time(commitment_height).await {
+								Ok(val) => val,
+								Err(err) => {
+									if let Err(err) = tx
+										.send(Err(anyhow!(
+											"Error encountered while querying state_machine_update_time {err:?}"
+										).into()))
+									{
+										log::error!(target: crate::LOG_TARGET, "Failed to send message over channel on {state_machine:?} \n {err:?}");
+										return
+									}
+									latest_height = header.number().into();
+									continue;
+								}
+							};
+
+							let mut state_commitment_vetoed_stream = client.state_commitment_vetoed_notification(latest_height, commitment_height).await;
+
+							let provider = Arc::new(client.clone());
+							tokio::select! {
+								_res = wait_for_challenge_period(provider, state_machine_update_time, counterparty_state_id) => {
+									match _res {
+										Ok(_) => {
+											if let Err(err) = tx.send(Ok(event.clone())) {
+												log::trace!(target: crate::LOG_TARGET, "Failed to send state machine update over channel on {state_machine:?} - {:?} \n {err:?}", counterparty_state_id.state_id);
+												return
+											};
+										}
+										Err(err) => {
+											log::error!(target: crate::LOG_TARGET, "Error waiting for challenge period in {state_machine:?} - {:?} update stream \n {err:?}", counterparty_state_id.state_id);
+										}
+									}
+								}
+								_res = state_commitment_vetoed_stream.next() => {
+									match _res {
+										Some(Ok(_)) => {
+											log::info!(target: crate::LOG_TARGET, "State Commitment for {event:?} was vetoed on {state_machine}");
+										}
+										_ => {
+											log::error!(target: crate::LOG_TARGET, "Error in state machine vetoed stream {state_machine:?} - {:?}", counterparty_state_id.state_id);
+										}
+									}
+								}
+							};
+						},
+						None => {},
+					};
+
+					latest_height = header.number().into();
+				}
+			}.boxed());
+		}
+
+		let stream = tokio_stream::wrappers::BroadcastStream::new(recv).filter_map(|res| async {
+			match res {
+				Ok(res) => Some(res),
+				Err(err) => Some(Err(anyhow!("{err:?}").into())),
+			}
+		});
+
+		Ok(Box::pin(stream))
+	}
+
+	async fn proof_accepted_notification(&self) -> Result<BoxStream<ProofAccepted>, anyhow::Error> {
+		use futures::StreamExt;
+
+		let client = self.clone();
+		let (tx, rx) = tokio::sync::mpsc::channel::<ProofAccepted>(512);
+
+		let initial_height = client.query_finalized_height().await?;
+		let state_machine = client.state_machine;
+
+		tokio::task::spawn(async move {
+			let mut cursor = initial_height;
+			let poll_interval = client.config.poll_interval.unwrap_or(10);
+
+			loop {
+				tokio::time::sleep(Duration::from_secs(poll_interval)).await;
+
+				let tip = match client.query_finalized_height().await {
+					Ok(h) => h,
+					Err(err) => {
+						log::error!(target: crate::LOG_TARGET, "{state_machine:?} proof_accepted: query_finalized_height: {err:?}");
+						continue;
+					},
+				};
+				if tip <= cursor {
+					continue;
+				}
+
+				let proofs = match client.proof_accepted_in_range(cursor, tip).await {
+					Ok(p) => p,
+					Err(err) => {
+						log::error!(
+							target: crate::LOG_TARGET,
+							"{state_machine:?} proof_accepted_in_range({}, {tip}): {err:?}",
+							cursor + 1,
+						);
+						continue;
+					},
+				};
+
+				// `try_send` so the poller never blocks on a slow
+				// consumer. On `Closed`, the receiver is gone — exit.
+				for proof in proofs {
+					match tx.try_send(proof) {
+						Ok(()) => {},
+						Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+							log::warn!(
+								target: crate::LOG_TARGET,
+								"{state_machine:?} ProofAccepted channel full; pausing poll until consumer catches up",
+							);
+							break;
+						},
+						Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+							return;
+						},
+					}
+				}
+
+				cursor = tip;
+			}
+		});
+
+		let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok);
+		Ok(Box::pin(stream))
+	}
+
+	async fn submit(
+		&self,
+		mut messages: Vec<Message>,
+		coprocessor: StateMachine,
+	) -> Result<TxResult, anyhow::Error> {
+		let mut futs = vec![];
+		let is_hyperbridge = self.state_machine == coprocessor;
+		for msg in &mut messages {
+			if let Some(bytes) = encode_message(&msg) {
+				let signature = self.sign(&bytes);
+				let encoded_signer = signature.encode();
+
+				match msg {
+					Message::Request(ref mut req) => req.signer = encoded_signer,
+					Message::Response(ref mut res) => res.signer = encoded_signer,
+					Message::Consensus(ref mut con) => con.signer = encoded_signer,
+					_ => {},
+				}
+			}
+			let is_consensus_message = matches!(&msg, Message::Consensus(_));
+			let extrinsic = subxt::dynamic::tx(
+				"Ismp",
+				"handle_unsigned",
+				vec![messages_to_value(vec![msg.clone()])],
+			);
+			// We don't compress consensus messages
+			// We only consider compression for hyperbridge
+			if is_consensus_message || !is_hyperbridge {
+				futs.push(send_unsigned_extrinsic(&self.client, extrinsic, false));
+				continue;
+			}
+			let encoded_call = extrinsic.encode_call_data(&self.client.metadata())?;
+			let uncompressed_len = encoded_call.len();
+			let max_compressed_size = zstd_safe::compress_bound(uncompressed_len);
+			let mut buffer = vec![0u8; max_compressed_size];
+			let compressed_call_len = zstd_safe::compress(&mut buffer[..], &encoded_call, 3)
+				.map_err(|_| anyhow!("Call compression failed"))?;
+			// If compression saving is less than 15% submit the uncompressed call
+			if (uncompressed_len.saturating_sub(compressed_call_len) * 100 / uncompressed_len) <
+				20usize
+			{
+				log::trace!(target: crate::LOG_TARGET, "Submitting uncompressed call: compressed:{}kb, uncompressed:{}kb", compressed_call_len / 1000,  uncompressed_len / 1000);
+				futs.push(send_unsigned_extrinsic(&self.client, extrinsic, false))
+			} else {
+				let compressed_call = buffer[0..compressed_call_len].to_vec();
+				let call = vec![value!(compressed_call), value!(uncompressed_len as u32)];
+				let extrinsic = subxt::dynamic::tx("CallDecompressor", "decompress_call", call);
+				log::trace!(target: crate::LOG_TARGET, "Submitting compressed call: compressed:{}kb, uncompressed:{}kb", compressed_call_len / 1000,  uncompressed_len / 1000);
+				futs.push(send_unsigned_extrinsic(&self.client, extrinsic, false))
+			}
+		}
+		let results = futures::future::join_all(futs)
+			.await
+			.into_iter()
+			.collect::<Result<Vec<_>, _>>()?;
+		let receipts = results
+			.into_iter()
+			.filter_map(|val| val.map(|(_, receipts)| receipts))
+			.flatten()
+			.collect::<Vec<_>>();
+
+		let mut results = vec![];
+		let height = {
+			let block = self
+				.rpc
+				.chain_get_header(None)
+				.await?
+				.ok_or_else(|| anyhow!("Failed to get latest height"))?;
+			block.number().into()
+		};
+		for msg in messages {
+			match msg {
+				Message::Request(req_msg) =>
+					for post in req_msg.requests {
+						let req = Request::Post(post);
+						let commitment = hash_request::<Hasher>(&req);
+						if receipts.contains(&commitment) {
+							let tx_receipt = TxReceipt {
+								query: Query {
+									source_chain: req.source_chain(),
+									dest_chain: req.dest_chain(),
+									nonce: req.nonce(),
+									commitment,
+								},
+								height,
+							};
+
+							results.push(tx_receipt);
+						}
+					},
+				// `Message::Response` carries only GetRequests being responded to post-#840;
+				// no relayer receipt to record.
+				_ => {},
+			}
+		}
+		Ok(TxResult { receipts: results, ..Default::default() })
+	}
+
+	async fn query_challenge_period(&self, id: StateMachineId) -> Result<Duration, anyhow::Error> {
+		let params = rpc_params![id];
+		let response: u64 = self.rpc_client.request("ismp_queryChallengePeriod", params).await?;
+
+		Ok(Duration::from_secs(response))
+	}
+
+	async fn query_timestamp(&self) -> Result<Duration, anyhow::Error> {
+		let timestamp_key =
+			hex!("f0c365c3cf59d671eb72da0e7a4113c49f1f0515f462cdcf84e0f1d6045dfcbb").to_vec();
+		let response = self
+			.rpc
+			.state_get_storage(&timestamp_key, None)
+			.await?
+			.ok_or_else(|| anyhow!("Failed to fetch timestamp"))?;
+		let timestamp: u64 = codec::Decode::decode(&mut response.as_slice())?;
+
+		Ok(Duration::from_millis(timestamp))
+	}
+
+	fn request_commitment_full_key(&self, commitment: H256) -> Vec<Vec<u8>> {
+		vec![self.req_commitments_key(commitment)]
+	}
+
+	fn request_receipt_full_key(&self, commitment: H256) -> Vec<Vec<u8>> {
+		vec![self.req_receipts_key(commitment)]
+	}
+
+	fn address(&self) -> Vec<u8> {
+		self.address.clone()
+	}
+
+	fn sign(&self, msg: &[u8]) -> tesseract_primitives::Signature {
+		let signature = self.signer.sign(msg).0.to_vec();
+		Signature::Sr25519 { public_key: self.address.clone(), signature }
+	}
+
+	async fn set_latest_finalized_height(
+		&mut self,
+		counterparty: Arc<dyn IsmpProvider>,
+	) -> Result<(), anyhow::Error> {
+		self.set_latest_finalized_height(counterparty).await
+	}
+
+	async fn set_initial_consensus_state(
+		&self,
+		message: CreateConsensusState,
+	) -> Result<(), Error> {
+		self.create_consensus_state(message).await?;
+		Ok(())
+	}
+
+	async fn query_state_machine_commitment(
+		&self,
+		height: StateMachineHeight,
+	) -> Result<StateCommitment, Error> {
+		let key = state_machine_commitment_storage_key(height);
+		let block_hash = self
+			.rpc
+			.chain_get_block_hash(None)
+			.await?
+			.ok_or_else(|| anyhow!("Failed to query latest block hash"))?;
+		let raw_value =
+			self.client.storage().at(block_hash).fetch_raw(key.clone()).await?.ok_or_else(
+				|| anyhow!("State commitment not present for state machine {:?}", height),
+			)?;
+
+		let commitment = Decode::decode(&mut &*raw_value)?;
+		Ok(commitment)
+	}
+
+	async fn veto_state_commitment(&self, height: StateMachineHeight) -> Result<(), Error> {
+		let signer = self.in_memory_signer();
+		let call = subxt::dynamic::tx(
+			"Fishermen",
+			"veto_state_commitment",
+			vec![state_machine_height_to_value(&height)],
+		);
+		send_extrinsic(&self.client, &signer, &call, Some(100), true).await?;
+		Ok(())
+	}
+
+	async fn query_host_params(
+		&self,
+		state_machine: StateMachine,
+	) -> Result<HostParam, anyhow::Error> {
+		let key = host_params_storage_key(state_machine);
+		let block_hash = self
+			.rpc
+			.chain_get_block_hash(None)
+			.await?
+			.ok_or_else(|| anyhow!("Failed to query latest block hash"))?;
+		let raw_params = self
+			.client
+			.storage()
+			.at(block_hash)
+			.fetch_raw(key.clone())
+			.await?
+			.ok_or_else(|| anyhow!("Missing host params for {state_machine:?}"))?;
+
+		let params = Decode::decode(&mut &*raw_params)?;
+		Ok(params)
+	}
+
+	fn max_concurrent_queries(&self) -> usize {
+		self.max_concurent_queries.unwrap_or(10) as usize
+	}
+
+	async fn fee_token_decimals(&self) -> Result<u8, anyhow::Error> {
+		// Default for USDT and USDC on polkadot chains is 6
+		Ok(self.config.fee_token_decimals.unwrap_or(6))
+	}
+}
+
+// The storage key needed to access events.
+pub fn system_events_key() -> StorageKey {
+	let mut storage_key = sp_crypto_hashing::twox_128(b"System").to_vec();
+	storage_key.extend(sp_crypto_hashing::twox_128(b"Events").to_vec());
+	StorageKey(storage_key)
+}
+
+fn encode_message(msg: &Message) -> Option<[u8; 32]> {
+	return match msg {
+		Message::Request(request_message) => Some(keccak_256(&request_message.requests.encode())),
+		Message::Response(response_message) =>
+			Some(keccak_256(&response_message.requests.encode())),
+		Message::Consensus(consensus_message) =>
+			Some(keccak_256(&consensus_message.consensus_proof)),
+		Message::FraudProof(_) | Message::Timeout(_) => None,
+	};
+}
+
+#[cfg(test)]
+mod tests {
+	use ismp::host::StateMachine;
+	use subxt::{config::Header, ext::subxt_rpcs::rpc_params};
+	use subxt_utils::Hyperbridge;
+	use tesseract_primitives::ProofAccepted;
+
+	use crate::{system_events_key, SubstrateClient, SubstrateConfig};
+
+	const GARGANTUA_WS: &str = "wss://gargantua.rpc.polytope.technology";
+
+	fn gargantua_config(rpc_ws: &str) -> SubstrateConfig {
+		SubstrateConfig {
+			state_machine: Some(StateMachine::Kusama(4009)),
+			hashing: None,
+			// `SubstrateClient::new` reads this unconditionally, so the helper stands in for
+			// what `SubstrateConfig::resolve` would have derived for a Kusama parachain.
+			consensus_state_id: Some("PAS0".to_string()),
+			rpc_ws: rpc_ws.to_string(),
+			max_rpc_payload_size: None,
+			// Dummy seed — the test never signs or submits anything.
+			signer: Some(
+				"0x0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+			),
+			initial_height: None,
+			max_concurent_queries: None,
+			poll_interval: None,
+			fee_token_decimals: None,
+		}
+	}
+
+	/// Drives the per-window body of `proof_accepted_notification` against
+	/// parachain blocks 8753269..=8753274 on live Gargantua and asserts the
+	/// `ProofAccepted { height: 8753260, new_set_id: Some(19044) }` event is
+	/// recovered.
+	///
+	/// Hits a remote RPC — gated with `#[ignore]` so CI skips it. Run with
+	/// `cargo test -p tesseract-substrate -- --ignored proof_accepted_range`.
+	#[tokio::test]
+	#[ignore]
+	async fn proof_accepted_range_gargantua() {
+		const FROM_BLOCK: u64 = 8753269;
+		const TO_BLOCK: u64 = 8753274;
+		const EXPECTED_HEIGHT: u64 = 8753260;
+		const EXPECTED_SET_ID: u64 = 19044;
+
+		let config = gargantua_config("ws://localhost:9944");
+
+		let client =
+			SubstrateClient::<Hyperbridge>::new(config).await.expect("connect to gargantua");
+
+		// `proof_accepted_in_range(cursor, tip)` is the exact per-window body
+		// that `proof_accepted_notification` dispatches each poll tick, so
+		// asserting on its output is asserting on the stream's output for that
+		// window.
+		let proofs = client
+			.proof_accepted_in_range(FROM_BLOCK - 1, TO_BLOCK)
+			.await
+			.expect("proof_accepted_in_range ok");
+
+		assert!(
+			proofs.iter().any(|p| p.height == EXPECTED_HEIGHT &&
+				p.new_set_id == Some(EXPECTED_SET_ID)),
+			"expected ProofAccepted(height={EXPECTED_HEIGHT}, new_set_id=Some({EXPECTED_SET_ID})) in blocks {FROM_BLOCK}..={TO_BLOCK}, got: {proofs:?}",
+		);
+
+		// Sanity-check the stream's ordering contract: mandatory (rotation)
+		// proofs come first in ascending height order, and at most one
+		// messaging proof — the newest in the window — trails them.
+		let mandatory_count = proofs.iter().filter(|p| p.new_set_id.is_some()).count();
+		let messaging_count = proofs.iter().filter(|p| p.new_set_id.is_none()).count();
+		assert!(messaging_count <= 1, "messaging proofs should be coalesced to at most one");
+		for pair in proofs[..mandatory_count].windows(2) {
+			assert!(pair[0].height <= pair[1].height, "mandatory proofs out of order");
+		}
+		if messaging_count == 1 {
+			assert!(
+				proofs.last().and_then(|p| p.new_set_id).is_none(),
+				"messaging proof must be the last entry",
+			);
+		}
+	}
+
+	// Compile-time nudge so we notice if ProofAccepted's shape drifts.
+	#[allow(dead_code)]
+	fn _proof_accepted_shape(p: ProofAccepted) -> (u64, Option<u64>) {
+		(p.height, p.new_set_id)
+	}
+
+	/// Drives a client against live Gargantua and touches every shape of traffic the relayer
+	/// relies on: the metadata download and header read that `SubstrateClient::new` performs,
+	/// a raw custom rpc, a storage read through the online client, all of which travel over
+	/// the derived http endpoint, and a finalized head subscription over the websocket.
+	///
+	/// Hits a remote RPC — gated with `#[ignore]` so CI skips it. Run with
+	/// `cargo test -p tesseract-substrate -- --ignored http_transport`.
+	#[tokio::test]
+	#[ignore]
+	async fn http_transport_serves_queries_and_subscriptions() {
+		let client = SubstrateClient::<Hyperbridge>::new(gargantua_config(GARGANTUA_WS))
+			.await
+			.expect("connect to gargantua");
+
+		let header = client
+			.rpc
+			.chain_get_header(None)
+			.await
+			.expect("chain_getHeader over http")
+			.expect("gargantua always has a head");
+		assert!(header.number() > 0);
+
+		let chain: String = client
+			.rpc_client
+			.request("system_chain", rpc_params![])
+			.await
+			.expect("raw custom rpc over http");
+		assert!(chain.contains("Gargantua"), "unexpected chain name {chain}");
+
+		let block_hash = client
+			.rpc
+			.chain_get_block_hash(Some(header.number().into()))
+			.await
+			.expect("chain_getBlockHash over http")
+			.expect("hash for the head we just read");
+		client
+			.client
+			.storage()
+			.at(block_hash)
+			.fetch_raw(system_events_key().0)
+			.await
+			.expect("storage read over http");
+
+		let mut heads = client
+			.rpc
+			.chain_subscribe_finalized_heads()
+			.await
+			.expect("subscription over the websocket");
+		heads
+			.next()
+			.await
+			.expect("a finalized head within the block time")
+			.expect("a well formed header");
+	}
+}

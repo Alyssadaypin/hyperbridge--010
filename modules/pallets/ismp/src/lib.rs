@@ -1,0 +1,779 @@
+// Copyright (c) 2025 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![doc = include_str!("../README.md")]
+#![cfg_attr(not(feature = "std"), no_std)]
+#![deny(unused_imports)]
+
+extern crate alloc;
+extern crate core;
+
+pub mod child_trie;
+pub mod dispatcher;
+pub mod errors;
+pub mod events;
+pub mod fee_handler;
+pub mod host;
+mod impls;
+pub mod migrations;
+pub mod offchain;
+mod utils;
+pub mod weights;
+use crate::offchain::Leaf;
+use offchain::OffchainDBProvider;
+use polkadot_sdk::*;
+// Re-export pallet items so that they can be accessed from the crate namespace.
+pub use pallet::*;
+
+// Definition of the pallet logic, to be aggregated at runtime definition through
+// `construct_runtime`.
+#[frame_support::pallet]
+pub mod pallet {
+	use super::*;
+
+	use crate::{
+		child_trie::{RequestCommitments, ResponseCommitments, CHILD_TRIE_PREFIX},
+		errors::HandlingError,
+		fee_handler::FeeHandler,
+	};
+	use alloc::collections::BTreeMap;
+	use codec::{Codec, Encode};
+	use core::fmt::Debug;
+	use frame_support::{
+		dispatch::DispatchResult,
+		pallet_prelude::*,
+		traits::{fungible::Mutate, tokens::Preservation, Get, UnixTime},
+		PalletId,
+	};
+	use frame_system::pallet_prelude::{BlockNumberFor, *};
+	use ismp::{
+		consensus::{
+			ConsensusClientId, ConsensusStateId, StateCommitment, StateMachineHeight,
+			StateMachineId,
+		},
+		events::{RequestResponseHandled, TimeoutHandled},
+		handlers,
+		host::{IsmpHost, StateMachine},
+		messaging::{CreateConsensusState, Message},
+		router::IsmpRouter,
+	};
+	use sp_core::{storage::ChildInfo, H256};
+	use sp_runtime::{
+		traits::{AccountIdConversion, AtLeast32BitUnsigned},
+		transaction_validity::{
+			InvalidTransaction, TransactionSource, TransactionValidity, TransactionValidityError,
+			ValidTransaction,
+		},
+		FixedPointOperand,
+	};
+	use sp_std::prelude::*;
+	pub use utils::*;
+
+	/// [`PalletId`] where relayer fees will be collected
+	pub const RELAYER_FEE_ACCOUNT: PalletId = PalletId(*b"ISMPFEES");
+
+	/// Default number of state commitments retained per chain in
+	/// [`BoundedStateCommitments`]. Chains can be given a different retention
+	/// depth via [`StateMachineCommitmentCap`], sized to their finality
+	/// cadence: a chain that finalizes every few seconds needs a much larger
+	/// cap than one that finalizes every few minutes to cover the same
+	/// wall-clock window.
+	pub const MAX_STATE_MACHINE_COMMITMENTS: u32 = 10_240;
+
+	/// Upper bound on evictions performed by a single
+	/// [`Pallet::insert_bounded_state_commitment`] call. At steady state each
+	/// insertion evicts exactly one entry; the headroom lets the queue drain
+	/// gradually after a per-chain cap is lowered without unbounded work in
+	/// one call.
+	pub const MAX_COMMITMENT_EVICTIONS_PER_INSERT: u32 = 4;
+
+	#[pallet::config]
+	pub trait Config: polkadot_sdk::frame_system::Config {
+		/// Admin origin for privileged actions such as adding new consensus clients as well as
+		/// modifying existing consensus clients (eg. challenge period, unbonding period)
+		type AdminOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+
+		/// Timestamp interface [`UnixTime`] for querying the current timestamp. This is used within
+		/// the various ISMP sub-protocols.
+		type TimestampProvider: UnixTime;
+
+		/// The balance of an account.
+		type Balance: Parameter
+			+ Member
+			+ AtLeast32BitUnsigned
+			+ Codec
+			+ Default
+			+ Copy
+			+ MaybeSerializeDeserialize
+			+ Debug
+			+ MaxEncodedLen
+			+ TypeInfo
+			+ FixedPointOperand;
+
+		/// The currency that is offered to relayers as payment for request delivery
+		/// and execution. This should ideally be a stablecoin of some kind to guarantee
+		/// predictable and stable revenue for relayers.
+		///
+		/// This can also be used with pallet-assets through the
+		/// [ItemOf](frame_support::traits::tokens::fungible::ItemOf) implementation
+		type Currency: Mutate<Self::AccountId, Balance = Self::Balance>;
+
+		/// The state machine identifier for the host chain. This is the identifier that will be
+		/// used to accept requests that are addressed to this state machine. Remote chains
+		/// will also use this identifier to accept requests originating from this state
+		/// machine.
+		type HostStateMachine: Get<StateMachine>;
+
+		/// The coprocessor is a state machine which proxies requests on our behalf. The coprocessor
+		/// does this by performing the costly consensus and state proof verification needed to
+		/// verify requests/responses that are addressed to this host state machine.
+		///
+		/// The ISMP framework permits the coprocessor to aggregate messages from potentially
+		/// multiple state machines. Finally producing much cheaper proofs of consensus and state
+		/// needed to verify the legitimacy of the messages.
+		type Coprocessor: Get<Option<StateMachine>>;
+
+		/// [`IsmpRouter`] implementation for routing requests & responses to their appropriate
+		/// modules.
+		type Router: IsmpRouter + Default;
+
+		/// This should provide a list of [`ConsenusClient`](ismp::consensus::ConsensusClient)s
+		/// which should be used to validate incoming requests or responses. There should be
+		/// at least one consensus client present to allow messages be processed by the ISMP
+		/// subsystems.
+		type ConsensusClients: ConsensusClientProvider;
+
+		/// Fee handling implementation for ISMP message processing.
+		///
+		/// This type defines how fees are calculated and settled for different ISMP message types.
+		/// It provides an extensible way to implement various fee models based on chain-specific
+		/// requirements, including:
+		///
+		/// - Weight-based fee calculations for computational resources
+		/// - Custom economic incentives for relayers and validators
+		/// - Different fee structures for various message types (requests, responses, consensus)
+		/// - Support for subsidized operations or negative fee models
+		///
+		/// The chosen implementation determines how transaction fees are calculated when
+		/// processing ISMP messages, directly affecting the economic sustainability of the
+		/// cross-chain messaging system.
+		type FeeHandler: FeeHandler;
+
+		/// Offchain database implementation. Outgoing requests and responses are
+		/// inserted in this database, while their commitments are stored onchain.
+		///
+		/// This offchain DB is also allowed to "merkelize" and "generate proofs" for messages.
+		/// Most state machines will likey not need this and can just provide `()`
+		type OffchainDB: OffchainDBProvider<Leaf = Leaf>;
+	}
+
+	// Simple declaration of the `Pallet` type. It is placeholder we use to implement traits and
+	// method.
+	#[pallet::pallet]
+	#[pallet::without_storage_info]
+	pub struct Pallet<T>(_);
+
+	/// Holds a map of consensus state identifiers to their consensus state.
+	#[pallet::storage]
+	#[pallet::getter(fn consensus_states)]
+	pub type ConsensusStates<T: Config> =
+		StorageMap<_, Twox64Concat, ConsensusClientId, Vec<u8>, OptionQuery>;
+
+	/// A mapping of consensus state identifier to it's associated consensus client identifier
+	#[pallet::storage]
+	pub type ConsensusStateClient<T: Config> =
+		StorageMap<_, Blake2_128Concat, ConsensusStateId, ConsensusClientId, OptionQuery>;
+
+	/// A mapping of consensus state identifiers to their unbonding periods
+	#[pallet::storage]
+	pub type UnbondingPeriod<T: Config> =
+		StorageMap<_, Blake2_128Concat, ConsensusStateId, u64, OptionQuery>;
+
+	/// A mapping of state machine Ids to their challenge periods
+	#[pallet::storage]
+	#[pallet::getter(fn challenge_period)]
+	pub type ChallengePeriod<T: Config> =
+		StorageMap<_, Blake2_128Concat, StateMachineId, u64, OptionQuery>;
+
+	/// Holds a map of consensus clients frozen due to byzantine
+	/// behaviour
+	#[pallet::storage]
+	#[pallet::getter(fn frozen_consensus_clients)]
+	pub type FrozenConsensusClients<T: Config> =
+		StorageMap<_, Blake2_128Concat, ConsensusStateId, bool, ValueQuery>;
+
+	/// The latest verified height for a state machine
+	#[pallet::storage]
+	#[pallet::getter(fn latest_state_machine_height)]
+	pub type LatestStateMachineHeight<T: Config> =
+		StorageMap<_, Blake2_128Concat, StateMachineId, u64, OptionQuery>;
+
+	/// The previous verified height for a state machine
+	#[pallet::storage]
+	#[pallet::getter(fn previous_state_machine_height)]
+	pub type PreviousStateMachineHeight<T: Config> =
+		StorageMap<_, Blake2_128Concat, StateMachineId, u64, OptionQuery>;
+
+	/// Holds the timestamp at which a consensus client was recently updated.
+	/// Used in ensuring that the configured challenge period elapses.
+	#[pallet::storage]
+	#[pallet::getter(fn consensus_update_time)]
+	pub type ConsensusClientUpdateTime<T: Config> =
+		StorageMap<_, Twox64Concat, ConsensusClientId, u64, OptionQuery>;
+
+	/// Holds a map of state machine heights to their verified state commitments. These state
+	/// commitments end up here after they are successfully verified by a `ConsensusClient`.
+	/// Keyed by `(StateMachineId, height)` so we can cap entries per chain at
+	/// [`StateMachineCommitmentCap`] (default [`MAX_STATE_MACHINE_COMMITMENTS`]).
+	#[pallet::storage]
+	#[pallet::getter(fn state_commitments)]
+	pub type BoundedStateCommitments<T: Config> = StorageDoubleMap<
+		_,
+		Blake2_128Concat,
+		StateMachineId,
+		Blake2_128Concat,
+		u64,
+		StateCommitment,
+		OptionQuery,
+	>;
+
+	/// Holds the timestamp at which a state machine height was updated. Used in ensuring
+	/// that the configured challenge period elapses. Same per-chain cap as
+	/// [`BoundedStateCommitments`].
+	#[pallet::storage]
+	#[pallet::getter(fn state_machine_update_time)]
+	pub type BoundedStateMachineUpdateTime<T: Config> = StorageDoubleMap<
+		_,
+		Blake2_128Concat,
+		StateMachineId,
+		Blake2_128Concat,
+		u64,
+		u64,
+		OptionQuery,
+	>;
+
+	/// Per-chain FIFO queue of heights retained in [`BoundedStateCommitments`]
+	/// and [`BoundedStateMachineUpdateTime`], keyed by a monotonically
+	/// increasing insertion index. Insertion order matches height order because
+	/// consensus updates only ever advance a state machine, so evicting at the
+	/// head removes the oldest height. Entries whose height was vetoed via
+	/// `delete_state_commitment` are left in place and become harmless no-ops
+	/// when their index is evicted.
+	///
+	/// Each insertion touches O(1) small storage items, so the per-chain cap
+	/// can grow without adding I/O or PoV weight to the insert path.
+	#[pallet::storage]
+	pub type StateCommitmentQueue<T: Config> = StorageDoubleMap<
+		_,
+		Blake2_128Concat,
+		StateMachineId,
+		Twox64Concat,
+		u64,
+		u64,
+		OptionQuery,
+	>;
+
+	/// Head/tail indices for [`StateCommitmentQueue`], per chain.
+	#[pallet::storage]
+	pub type CommitmentQueueStates<T: Config> =
+		StorageMap<_, Blake2_128Concat, StateMachineId, CommitmentQueueState, ValueQuery>;
+
+	/// Per-chain override for the number of state commitments retained. Chains
+	/// with faster finality emit state machine updates more frequently and
+	/// need a deeper queue to retain the same wall-clock window of provable
+	/// heights. Falls back to [`MAX_STATE_MACHINE_COMMITMENTS`] when unset.
+	#[pallet::storage]
+	pub type StateMachineCommitmentCap<T: Config> =
+		StorageMap<_, Blake2_128Concat, StateMachineId, u32, OptionQuery>;
+
+	/// Tracks requests that have been responded to
+	/// The key is the request commitment
+	#[pallet::storage]
+	#[pallet::getter(fn responded)]
+	pub type Responded<T: Config> = StorageMap<_, Identity, H256, bool, ValueQuery>;
+
+	/// Latest nonce for messages sent from this chain
+	#[pallet::storage]
+	#[pallet::getter(fn nonce)]
+	pub type Nonce<T> = StorageValue<_, u64, ValueQuery>;
+
+	/// The child trie root of messages
+	#[pallet::storage]
+	#[pallet::getter(fn child_trie_root)]
+	pub type ChildTrieRoot<T: Config> =
+		StorageValue<_, <T as frame_system::Config>::Hash, ValueQuery>;
+
+	// Pallet implements [`Hooks`] trait to define some logic to execute in some context.
+	#[pallet::hooks]
+	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T>
+	where
+		<T as frame_system::Config>::Hash: From<H256>,
+	{
+		fn on_finalize(_n: BlockNumberFor<T>) {
+			let state_version = <T as polkadot_sdk::frame_system::Config>::Version::get()
+				.state_version()
+				.try_into()
+				.unwrap_or_default();
+
+			let child_trie_root =
+				storage::child::root(&ChildInfo::new_default(CHILD_TRIE_PREFIX), state_version);
+
+			let child_trie_root = H256::from_slice(&child_trie_root);
+			ChildTrieRoot::<T>::put::<T::Hash>(child_trie_root.into());
+
+			let root = match T::OffchainDB::finalize() {
+				Ok(root) => root,
+				Err(e) => {
+					log::error!(target:"ismp", "Failed to finalize MMR {e:?}");
+					return;
+				},
+			};
+
+			let log = ConsensusDigest { child_trie_root, mmr_root: root.into() };
+			let digest = sp_runtime::generic::DigestItem::Consensus(ISMP_ID, log.encode());
+			<frame_system::Pallet<T>>::deposit_log(digest);
+
+			let timestamp_secs = T::TimestampProvider::now().as_secs();
+			let timestamp_log = TimestampDigest { timestamp: timestamp_secs };
+			let timestamp_digest = sp_runtime::generic::DigestItem::Consensus(
+				ISMP_TIMESTAMP_ID,
+				timestamp_log.encode(),
+			);
+			<frame_system::Pallet<T>>::deposit_log(timestamp_digest);
+		}
+	}
+
+	#[pallet::call]
+	impl<T: Config> Pallet<T> {
+		/// Execute the provided batch of ISMP messages, this will short-circuit and revert if any
+		/// of the provided messages are invalid. This is an unsigned extrinsic that permits anyone
+		/// execute ISMP messages for free, provided they have valid proofs and the messages have
+		/// not been previously processed.
+		///
+		/// The dispatch origin for this call must be an unsigned one.
+		///
+		/// - `messages`: the messages to handle or process.
+		///
+		/// Emits different message events based on the Message received if successful.
+		#[pallet::weight(weight())]
+		#[pallet::call_index(0)]
+		#[frame_support::transactional]
+		pub fn handle_unsigned(
+			origin: OriginFor<T>,
+			messages: Vec<Message>,
+		) -> DispatchResultWithPostInfo {
+			ensure_none(origin)?;
+
+			Self::execute(messages.clone())?;
+
+			Ok(().into())
+		}
+
+		/// Create a consensus client, using a subjectively chosen consensus state. This can also
+		/// be used to overwrite an existing consensus state. The dispatch origin for this
+		/// call must be `T::AdminOrigin`.
+		///
+		/// - `message`: [`CreateConsensusState`] struct.
+		///
+		/// Emits [`Event::ConsensusClientCreated`] if successful.
+		#[pallet::weight(<T as frame_system::Config>::DbWeight::get().reads_writes(1, 1))]
+		#[pallet::call_index(2)]
+		pub fn create_consensus_client(
+			origin: OriginFor<T>,
+			message: CreateConsensusState,
+		) -> DispatchResult {
+			T::AdminOrigin::ensure_origin(origin)?;
+			let host = Pallet::<T>::default();
+
+			let result = handlers::create_client(&host, message)
+				.map_err(|_| Error::<T>::ConsensusClientCreationFailed)?;
+
+			Self::deposit_event(Event::<T>::ConsensusClientCreated {
+				consensus_client_id: result.consensus_client_id,
+			});
+
+			Ok(())
+		}
+
+		/// Modify the unbonding period and challenge period for a consensus state.
+		/// The dispatch origin for this call must be `T::AdminOrigin`.
+		///
+		/// - `message`: `UpdateConsensusState` struct.
+		#[pallet::weight(<T as frame_system::Config>::DbWeight::get().writes(2))]
+		#[pallet::call_index(3)]
+		pub fn update_consensus_state(
+			origin: OriginFor<T>,
+			message: UpdateConsensusState,
+		) -> DispatchResult {
+			T::AdminOrigin::ensure_origin(origin)?;
+
+			let host = Pallet::<T>::default();
+
+			if let Some(unbonding_period) = message.unbonding_period {
+				host.store_unbonding_period(message.consensus_state_id, unbonding_period)
+					.map_err(|_| Error::<T>::UnbondingPeriodUpdateFailed)?;
+			}
+
+			for (state_id, period) in message.challenge_periods {
+				let id =
+					StateMachineId { state_id, consensus_state_id: message.consensus_state_id };
+				host.store_challenge_period(id, period)
+					.map_err(|_| Error::<T>::UnbondingPeriodUpdateFailed)?;
+			}
+
+			Ok(())
+		}
+
+		/// Add more funds to a message (request or response) to be used for delivery and execution.
+		///
+		/// Should not be called on a message that has been completed (delivered or timed-out) as
+		/// those funds will be lost forever.
+		#[pallet::weight(<T as frame_system::Config>::DbWeight::get().writes(5))]
+		#[pallet::call_index(4)]
+		pub fn fund_message(
+			origin: OriginFor<T>,
+			message: FundMessageParams<T::Balance>,
+		) -> DispatchResult {
+			let account = ensure_signed(origin)?;
+
+			let metadata = match message.commitment {
+				MessageCommitment::Request(commitment) => RequestCommitments::<T>::get(commitment),
+				MessageCommitment::Response(commitment) =>
+					ResponseCommitments::<T>::get(commitment),
+			};
+
+			let Some(mut metadata) = metadata else {
+				return Err(Error::<T>::MessageNotFound.into());
+			};
+
+			T::Currency::transfer(
+				&account,
+				&RELAYER_FEE_ACCOUNT.into_account_truncating(),
+				message.amount,
+				Preservation::Expendable,
+			)?;
+
+			match message.commitment {
+				MessageCommitment::Request(commiment) => {
+					metadata.fee.fee += message.amount;
+					RequestCommitments::<T>::insert(commiment, metadata);
+				},
+				MessageCommitment::Response(commiment) => {
+					metadata.fee.fee += message.amount;
+					ResponseCommitments::<T>::insert(commiment, metadata);
+				},
+			};
+
+			Ok(())
+		}
+
+		/// Set the number of state commitments retained per chain, overriding
+		/// [`MAX_STATE_MACHINE_COMMITMENTS`]. Size each cap to the chain's
+		/// finality cadence: `desired retention window / finality interval`.
+		/// Raising a cap simply pauses eviction until the queue grows into it;
+		/// lowering one drains the excess gradually, bounded by
+		/// [`MAX_COMMITMENT_EVICTIONS_PER_INSERT`] per subsequent insertion.
+		///
+		/// The dispatch origin for this call must be `T::AdminOrigin`.
+		#[pallet::weight(<T as frame_system::Config>::DbWeight::get().writes(commitment_caps.len() as u64))]
+		#[pallet::call_index(5)]
+		pub fn update_commitment_caps(
+			origin: OriginFor<T>,
+			commitment_caps: BTreeMap<StateMachineId, u32>,
+		) -> DispatchResult {
+			T::AdminOrigin::ensure_origin(origin)?;
+
+			ensure!(
+				commitment_caps.values().all(|cap| *cap > 0),
+				Error::<T>::InvalidCommitmentCap
+			);
+			for (id, cap) in commitment_caps {
+				StateMachineCommitmentCap::<T>::insert(id, cap);
+			}
+
+			Ok(())
+		}
+	}
+
+	/// Pallet Events
+	#[pallet::event]
+	#[pallet::generate_deposit(pub fn deposit_event)]
+	pub enum Event<T: Config> {
+		/// Emitted when a state machine is successfully updated to a new height
+		StateMachineUpdated {
+			/// State machine identifier
+			state_machine_id: StateMachineId,
+			/// State machine latest height
+			latest_height: u64,
+		},
+		/// Emitted when a state commitment is vetoed by a fisherman
+		StateCommitmentVetoed {
+			/// State machine height
+			height: StateMachineHeight,
+			/// responsible fisherman
+			fisherman: BoundedVec<u8, ConstU32<32>>,
+		},
+		/// Indicates that a consensus client has been created
+		ConsensusClientCreated {
+			/// Consensus client id
+			consensus_client_id: ConsensusClientId,
+		},
+		/// Indicates that a consensus client has been created
+		ConsensusClientFrozen {
+			/// Consensus client id
+			consensus_client_id: ConsensusClientId,
+		},
+		/// An Outgoing Response has been deposited
+		Response {
+			/// Chain that this response will be routed to
+			dest_chain: StateMachine,
+			/// Source Chain for this response
+			source_chain: StateMachine,
+			/// Nonce for the request which this response is for
+			request_nonce: u64,
+			/// Response Commitment
+			commitment: H256,
+			/// Request commitment
+			req_commitment: H256,
+		},
+		/// An Outgoing Request has been deposited
+		Request {
+			/// Chain that this request will be routed to
+			dest_chain: StateMachine,
+			/// Source Chain for request
+			source_chain: StateMachine,
+			/// Request nonce
+			request_nonce: u64,
+			/// Commitment
+			commitment: H256,
+		},
+		/// Some errors handling some ismp messages
+		Errors {
+			/// Message handling errors
+			errors: Vec<HandlingError>,
+		},
+		/// Post Request Handled
+		PostRequestHandled(RequestResponseHandled),
+		/// Get Response Handled
+		GetRequestHandled(RequestResponseHandled),
+		/// Post request timeout handled
+		PostRequestTimeoutHandled(TimeoutHandled),
+		/// Get request timeout handled
+		GetRequestTimeoutHandled(TimeoutHandled),
+		/// A relayer has withdrawn some fees owed by the protocol via the built-in
+		/// hyperbridge withdrawal handler.
+		RelayerFeeWithdrawn {
+			/// The amount that was withdrawn
+			amount: <T as Config>::Balance,
+			/// The withdrawal beneficiary
+			account: T::AccountId,
+		},
+	}
+
+	/// Pallet errors
+	#[pallet::error]
+	pub enum Error<T> {
+		/// Invalid ISMP message
+		InvalidMessage,
+		/// Requested message was not found
+		MessageNotFound,
+		/// Encountered an error while creating the consensus client.
+		ConsensusClientCreationFailed,
+		/// Couldn't update unbonding period
+		UnbondingPeriodUpdateFailed,
+		/// Couldn't update challenge period
+		ChallengePeriodUpdateFailed,
+		/// Error charging fee
+		ErrorChargingFee,
+		/// A state machine commitment cap must be non-zero
+		InvalidCommitmentCap,
+	}
+
+	/// This allows users execute ISMP datagrams for free. Use with caution.
+	#[pallet::validate_unsigned]
+	impl<T: Config> ValidateUnsigned for Pallet<T> {
+		type Call = Call<T>;
+
+		// empty pre-dispatch do we don't modify storage
+		fn pre_dispatch(_call: &Self::Call) -> Result<(), TransactionValidityError> {
+			Ok(())
+		}
+
+		fn validate_unsigned(_source: TransactionSource, call: &Self::Call) -> TransactionValidity {
+			use ismp::{
+				messaging::{hash_request, ConsensusMessage, FraudProofMessage, RequestMessage},
+				router::Request,
+			};
+			let messages = match call {
+				Call::handle_unsigned { messages } => messages,
+				_ => Err(TransactionValidityError::Invalid(InvalidTransaction::Call))?,
+			};
+
+			let events =
+				Self::execute(messages.clone()).map_err(|_| InvalidTransaction::BadProof)?;
+
+			if let Some((state_machine_id, latest_height)) = events.iter().find_map(|event| {
+				if let ismp::events::Event::StateMachineUpdated(state_machine_updated_event) = event
+				{
+					Some((
+						state_machine_updated_event.state_machine_id.clone(),
+						state_machine_updated_event.latest_height,
+					))
+				} else {
+					None
+				}
+			}) {
+				return Ok(ValidTransaction {
+					priority: latest_height,
+					requires: vec![],
+					provides: vec![sp_io::hashing::keccak_256(&state_machine_id.encode()).to_vec()],
+					longevity: 25,
+					propagate: true,
+				});
+			}
+
+			// No state machine was advanced by these messages. Build a content-unique
+			// `provides` tag from the messages themselves so that distinct submissions
+			// never collide in the transaction pool.
+			//
+			// A consensus message that doesn't advance a state machine (e.g. a
+			// validator-set rotation during sync) previously mapped to an empty request
+			// list via the catch-all arm. Every such message therefore produced an
+			// identical `provides` tag and a fixed priority of 100, so the pool rejected
+			// any two of them with "Priority is too low (100 vs 100)". Hashing the
+			// consensus message (excluding the signer, so equivalent submissions from
+			// different relayers dedupe) gives each update a unique tag.
+			let mut has_consensus = false;
+			let mut tags = messages
+				.into_iter()
+				.map(|message| match message {
+					Message::Consensus(ConsensusMessage {
+						consensus_proof,
+						consensus_state_id,
+						..
+					}) => {
+						has_consensus = true;
+						vec![H256(sp_io::hashing::keccak_256(
+							&(consensus_state_id, consensus_proof).encode(),
+						))]
+					},
+					Message::FraudProof(FraudProofMessage { proof_1, proof_2, .. }) => vec![
+						H256(sp_io::hashing::keccak_256(&proof_1)),
+						H256(sp_io::hashing::keccak_256(&proof_2)),
+					],
+					Message::Request(RequestMessage { requests, .. }) => requests
+						.into_iter()
+						.map(|post| hash_request::<Pallet<T>>(&Request::Post(post.clone())))
+						.collect::<Vec<_>>(),
+					Message::Response(message) => message
+						.requests()
+						.iter()
+						.map(|request| hash_request::<Pallet<T>>(request))
+						.collect::<Vec<_>>(),
+					Message::Timeout(message) => message
+						.requests()
+						.iter()
+						.map(|request| hash_request::<Pallet<T>>(request))
+						.collect::<Vec<_>>(),
+				})
+				.collect::<Vec<_>>();
+			tags.sort();
+
+			if tags.is_empty() {
+				return Err(TransactionValidityError::Invalid(InvalidTransaction::Call));
+			}
+
+			// this is so we can reject duplicate batches at the mempool level
+			let msg_hash = sp_io::hashing::keccak_256(&tags.encode()).to_vec();
+
+			Ok(ValidTransaction {
+				// consensus messages unblock everything else, so they are included ahead
+				// of request batches; identical submissions still share a priority so the
+				// pool can dedupe them
+				priority: if has_consensus { 200 } else { 100 },
+				// they are all self-contained batches that have no dependencies
+				requires: vec![],
+				// provides this unique hash of transactions
+				provides: vec![msg_hash],
+				// should only live for at most 10 blocks
+				longevity: 25,
+				// always propagate
+				propagate: true,
+			})
+		}
+	}
+
+	// Hack for implementing the [`Default`] bound needed for
+	// [`IsmpDispatcher`](ismp::dispatcher::IsmpDispatcher) and
+	// [`IsmpModule`](ismp::module::IsmpModule)
+	impl<T> Default for Pallet<T> {
+		fn default() -> Self {
+			Self(PhantomData)
+		}
+	}
+
+	/// Static weights because these should get overridden by the FeeHandler
+	fn weight() -> Weight {
+		Weight::from_parts(300_000_000, 0)
+	}
+
+	impl<T: Config> Pallet<T> {
+		/// Number of state commitments retained for `id`: the
+		/// [`StateMachineCommitmentCap`] override if set, otherwise
+		/// [`MAX_STATE_MACHINE_COMMITMENTS`].
+		pub fn state_machine_commitment_cap(id: StateMachineId) -> u32 {
+			StateMachineCommitmentCap::<T>::get(id).unwrap_or(MAX_STATE_MACHINE_COMMITMENTS)
+		}
+
+		/// Insert a state commitment into the bounded map. ISMP does not allow
+		/// duplicate state updates so we don't have an overwrite path.
+		///
+		/// Appends the height to the per-chain [`StateCommitmentQueue`] and, once
+		/// the chain's cap is exceeded, evicts oldest-first from the queue head.
+		/// Evictions are limited to [`MAX_COMMITMENT_EVICTIONS_PER_INSERT`] per
+		/// call so a lowered cap drains over many insertions rather than in one.
+		pub fn insert_bounded_state_commitment(
+			height: StateMachineHeight,
+			commitment: StateCommitment,
+		) {
+			let cap = Self::state_machine_commitment_cap(height.id).max(1) as u64;
+			let mut state = CommitmentQueueStates::<T>::get(height.id);
+
+			StateCommitmentQueue::<T>::insert(height.id, state.tail, height.height);
+			state.tail += 1;
+
+			let excess = (state.tail - state.head)
+				.saturating_sub(cap)
+				.min(MAX_COMMITMENT_EVICTIONS_PER_INSERT as u64);
+			for _ in 0..excess {
+				if let Some(old) = StateCommitmentQueue::<T>::take(height.id, state.head) {
+					BoundedStateCommitments::<T>::remove(height.id, old);
+					BoundedStateMachineUpdateTime::<T>::remove(height.id, old);
+				}
+				state.head += 1;
+			}
+
+			CommitmentQueueStates::<T>::insert(height.id, state);
+			BoundedStateCommitments::<T>::insert(height.id, height.height, commitment);
+		}
+
+		/// Insert a state machine update time into the bounded map. Shares the
+		/// [`StateCommitmentQueue`] with [`BoundedStateCommitments`] since both
+		/// maps track the same heights per chain.
+		pub fn insert_bounded_update_time(height: StateMachineHeight, timestamp: u64) {
+			BoundedStateMachineUpdateTime::<T>::insert(height.id, height.height, timestamp);
+		}
+	}
+}

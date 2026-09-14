@@ -1,0 +1,8 @@
+{
+  "title": "Contract Addresses",
+  "defaultOpen": false,
+  "pages": [
+    "mainnet",
+    "testnet"
+  ]
+}

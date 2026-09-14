@@ -1,0 +1,281 @@
+// Copyright (C) 2022 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#[cfg(test)]
+mod test;
+use polkadot_sdk::*;
+
+use alloy::{
+	eips::BlockId,
+	primitives::B256,
+	providers::{Provider, RootProvider},
+	rpc::client::RpcClient,
+	transports::{
+		http::{reqwest::Url, Http},
+		layers::FallbackService,
+	},
+};
+use anyhow::anyhow;
+use bsc_verifier::primitives::{compute_epoch, parse_extra, BscClientUpdate, Config};
+use geth_primitives::CodecHeader;
+use ismp::messaging::Keccak256;
+use sp_core::H256;
+use std::{fmt::Debug, marker::PhantomData, sync::Arc};
+use sync_committee_primitives::constants::BlsPublicKey;
+use tracing::{instrument, trace};
+
+#[derive(Clone)]
+pub struct BscPosProver<C: Config> {
+	/// Execution RPC client with fallback support for multiple URLs
+	pub client: Arc<RootProvider>,
+	/// Phantom data
+	_phantom_data: PhantomData<C>,
+}
+
+pub struct UpdateParams {
+	pub attested_header: CodecHeader,
+	pub validator_size: u64,
+	pub epoch_length: u64,
+	/// Current consensus client epoch
+	pub epoch: u64,
+	/// Use this bool to force fetching of validator set change outside of the default rotation
+	/// period
+	pub fetch_val_set_change: bool,
+}
+impl<C: Config> BscPosProver<C> {
+	pub fn new(urls: Vec<Url>) -> Result<Self, anyhow::Error> {
+		if urls.is_empty() {
+			return Err(anyhow!("At least one RPC URL must be provided"));
+		}
+
+		let client = if urls.len() == 1 {
+			let url =
+				urls.into_iter().next().ok_or_else(|| anyhow!("Expected at least one URL"))?;
+			RootProvider::new_http(url)
+		} else {
+			let transports: Vec<Http<_>> = urls.into_iter().map(|url| Http::new(url)).collect();
+			let active_count = transports.len();
+			let service = FallbackService::new(transports, active_count);
+			let rpc_client = RpcClient::builder().transport(service, false);
+			RootProvider::new(rpc_client)
+		};
+
+		Ok(Self { client: Arc::new(client), _phantom_data: PhantomData })
+	}
+
+	pub async fn fetch_header<T: Into<BlockId> + Send + Sync + Debug + Copy>(
+		&self,
+		block: T,
+	) -> Result<Option<CodecHeader>, anyhow::Error> {
+		let block = self.client.get_block(block.into()).await?.map(|b| b.into());
+
+		Ok(block)
+	}
+
+	#[instrument(level = "trace", target = "bsc-prover", skip(self))]
+	pub async fn latest_header(&self) -> Result<CodecHeader, anyhow::Error> {
+		trace!(target: "bsc-prover", "fetching latest header");
+		let block_number = self.client.get_block_number().await?;
+		let header = self
+			.fetch_header(block_number)
+			.await?
+			.ok_or_else(|| anyhow!("Latest header block could not be fetched {block_number}"))?;
+		Ok(header)
+	}
+
+	#[instrument(level = "trace", target = "bsc-prover", skip_all)]
+	pub async fn fetch_bsc_update<I: Keccak256>(
+		&self,
+		params: UpdateParams,
+	) -> Result<Option<BscClientUpdate>, anyhow::Error> {
+		trace!(target: "bsc-prover", "fetching bsc update for  {:?}", params.attested_header.number);
+		let parse_extra_data = parse_extra::<I, C>(&params.attested_header).map_err(|_| {
+			anyhow!("Extra data not found in header {:?}", params.attested_header.number)
+		})?;
+		let source_hash = H256::from_slice(&parse_extra_data.vote_data.source_hash.0);
+		let target_hash = H256::from_slice(&parse_extra_data.vote_data.target_hash.0);
+
+		if source_hash == Default::default() || target_hash == Default::default() {
+			return Ok(None);
+		}
+
+		let source_header = self
+			.fetch_header(B256::from(source_hash.0))
+			.await?
+			.ok_or_else(|| anyhow!("header block could not be fetched {source_hash}"))?;
+		let target_header = self
+			.fetch_header(B256::from(target_hash.0))
+			.await?
+			.ok_or_else(|| anyhow!("header block could not be fetched {target_hash}"))?;
+
+		// BEP-126 fast finality only finalizes `source_header` once the justified
+		// `target_header` is its direct child (two consecutive justified blocks).
+		// A non-adjacent vote leaves `source_header` merely justified and still
+		// reorg-able, so never emit such an update: the on-chain verifier rejects
+		// it (`NonConsecutiveFinalization`) and committing a reorg-able source as
+		// finalized would be unsound.
+		if target_header.number.low_u64() != source_header.number.low_u64().saturating_add(1) ||
+			target_header.parent_hash.0 != source_hash.0
+		{
+			trace!(
+				target: "bsc-prover",
+				"skipping non-adjacent vote: source #{} target #{} (target parent {:?} != source {source_hash:?})",
+				source_header.number.low_u64(),
+				target_header.number.low_u64(),
+				target_header.parent_hash,
+			);
+			return Ok(None);
+		}
+
+		let mut epoch_header_ancestry = vec![];
+		let epoch_header_number = params.epoch * params.epoch_length;
+		// If we are still in authority rotation period get the epoch header ancestry alongside
+		// update only if the finalized header is not the epoch block
+		let rotation_block =
+			get_rotation_block(epoch_header_number, params.validator_size, params.epoch_length) - 1;
+		if (params.attested_header.number.low_u64() >= epoch_header_number + 2 &&
+            params.attested_header.number.low_u64() <= rotation_block &&
+            source_header.number.low_u64() > epoch_header_number) ||
+            // If forcing a fetching of validator set, the source header must still be greater than  epoch header number
+            // To avoid the issue seen here https://testnet.bscscan.com/block/39713004 where the source header is lesser than the epoch header
+            // We will skip such updates.
+            (params.fetch_val_set_change && source_header.number.low_u64() > epoch_header_number)
+		{
+			let mut header =
+				self.fetch_header(B256::from(source_header.parent_hash.0)).await?.ok_or_else(
+					|| anyhow!("header block could not be fetched {}", source_header.parent_hash),
+				)?;
+			epoch_header_ancestry.insert(0, header.clone());
+			while header.number.low_u64() > epoch_header_number {
+				header = self.fetch_header(B256::from(header.parent_hash.0)).await?.ok_or_else(
+					|| anyhow!("header block could not be fetched {}", header.parent_hash),
+				)?;
+				epoch_header_ancestry.insert(0, header.clone());
+			}
+		}
+
+		let source_header_number = source_header.number.low_u64();
+		let attested_header_number = params.attested_header.number.low_u64();
+		let ancestry_len = epoch_header_ancestry.len();
+		let bsc_client_update = BscClientUpdate {
+            source_header,
+            target_header,
+            attested_header: params.attested_header,
+            epoch_header_ancestry: epoch_header_ancestry.try_into().map_err(|_| {
+                anyhow!("Epoch ancestry too large, Length {:?}, Epoch Header {epoch_header_number:?}, Source Header {source_header_number:?}, Attested Header {attested_header_number:?}",ancestry_len)
+            })?,
+        };
+
+		Ok(Some(bsc_client_update))
+	}
+
+	pub async fn fetch_finalized_state<I: Keccak256>(
+		&self,
+		epoch_length: u64,
+	) -> Result<(CodecHeader, Vec<BlsPublicKey>), anyhow::Error> {
+		let latest_header = self.latest_header().await?;
+
+		let current_epoch = compute_epoch(latest_header.number.low_u64(), epoch_length);
+		let current_epoch_block_number = current_epoch * epoch_length;
+
+		let current_epoch_header =
+			self.fetch_header(current_epoch_block_number).await?.ok_or_else(|| {
+				anyhow!("header block could not be fetched {current_epoch_block_number}")
+			})?;
+		let current_epoch_extra_data = parse_extra::<I, C>(&current_epoch_header)
+			.map_err(|_| anyhow!("Extra data set not found in header"))?;
+
+		let current_validators = current_epoch_extra_data
+			.validators
+			.into_iter()
+			.map(|val| val.bls_public_key.as_slice().try_into().expect("Infallible"))
+			.collect::<Vec<BlsPublicKey>>();
+		Ok((current_epoch_header, current_validators))
+	}
+}
+
+// Get the maximum block that can be signed by the previous validator set before
+// authority set rotation occurs. Validator set change happens at
+// `block % epoch_length == validator_size / 2`, so this returns the smallest
+// `n >= block` satisfying that congruence.
+//
+// Closed-form (constant-time) — previously this walked one block at a time in a
+// loop which was O(epoch_length) in the worst case.
+pub fn get_rotation_block(block: u64, validator_size: u64, epoch_length: u64) -> u64 {
+	let target = validator_size / 2;
+	let current = block % epoch_length;
+	// Distance forward to the next slot `epoch * epoch_length + target`, wrapping
+	// to the next epoch if we're already past `target` inside the current one.
+	let offset = (target + epoch_length - current) % epoch_length;
+	block + offset
+}
+
+#[cfg(test)]
+mod get_rotation_block_tests {
+	use super::get_rotation_block;
+
+	// Reference implementation used by the original loop-based version.
+	fn reference(mut block: u64, validator_size: u64, epoch_length: u64) -> u64 {
+		loop {
+			if block % epoch_length == (validator_size / 2) {
+				return block;
+			}
+			block += 1;
+		}
+	}
+
+	#[test]
+	fn matches_reference_across_epoch() {
+		let epoch_length = 1000u64;
+		let validator_size = 21u64;
+		for block in 0..(epoch_length * 3) {
+			assert_eq!(
+				get_rotation_block(block, validator_size, epoch_length),
+				reference(block, validator_size, epoch_length),
+				"block={block}",
+			);
+		}
+	}
+
+	#[test]
+	fn varies_with_validator_size() {
+		let epoch_length = 200u64;
+		// Only sizes where `validator_size / 2 < epoch_length` are meaningful:
+		// larger sizes make the rotation slot `block % epoch_length == target`
+		// unreachable, which causes the loop-based reference impl to spin
+		// forever. Real BSC has `validator_size << epoch_length` anyway.
+		for validator_size in [1u64, 2, 3, 21, 64, 199] {
+			for block in [0u64, 1, 99, 100, 101, 199, 200, 201, 399, 400] {
+				assert_eq!(
+					get_rotation_block(block, validator_size, epoch_length),
+					reference(block, validator_size, epoch_length),
+					"validator_size={validator_size} block={block}",
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn already_on_rotation_boundary_is_identity() {
+		// block=1010, epoch=1000, validator_size=21 → target=10, already at slot.
+		assert_eq!(get_rotation_block(1010, 21, 1000), 1010);
+	}
+
+	#[test]
+	fn jumps_to_next_epoch_when_past_target() {
+		// block=1015, epoch=1000, validator_size=21 → target=10, must skip to 2010.
+		assert_eq!(get_rotation_block(1015, 21, 1000), 2010);
+	}
+}

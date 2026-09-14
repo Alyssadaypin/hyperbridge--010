@@ -1,0 +1,40 @@
+---
+title: Fees
+description: How relayer fees work for Polkadot-SDK chains dispatching messages through Hyperbridge.
+---
+# Hyperbridge Fees
+
+Hyperbridge no longer charges a protocol fee on Polkadot-SDK chains. Dispatching is free at the runtime layer — applications only need to attach an optional **relayer fee** if they want third-party relayers to deliver their messages.
+
+## Relayer Fees
+
+The relayer fee is an optional incentive provided by applications initiating cross-chain transactions. It compensates Hyperbridge's decentralized relayers for delivering messages to the destination chain. Apps that prefer to self-relay can leave the fee at zero.
+
+The fee is collected by `pallet-ismp`'s `IsmpDispatcher` from the configured `Currency` (typically a stablecoin). It's escrowed into the `RELAYER_FEE_ACCOUNT` and paid out to the relayer that delivers the message (or refunded to the payer on timeout).
+
+### Components
+
+The fee consists of three parts:
+
+| Component | Description |
+|-----------|-------------|
+| **Proof verification cost** | For a cross-chain message to be delivered and executed, it must first be authenticated through state proofs. The expected cost for state proof verification on EVM chains is ~150k gas. Modules should account for this cost when setting the relayer fee. |
+| **Message execution gas cost** | After proof verification, the receiving module is handed the request to be executed. This will consume some gas which should also be accounted for. |
+| **Relayer service fee** | This additional amount rewards relayers for their services. Relayers are profit-driven mediators and they will prioritize messages with fees that ensure profitability. |
+
+Calculating the relayer fee can be expressed as follows:
+
+```
+destination_gas_cost = 150_000 + receiving_module_gas_cost
+relayer_fee = gas_price_to_usd(destination_gas_price * destination_gas_cost) + relayer_tip_usd
+```
+
+## Hyperbridge-initiated relayer fee withdrawals
+
+Relayers accumulate their earned fees on Hyperbridge. When a relayer initiates a withdrawal, Hyperbridge dispatches a POST request back to the source chain. `pallet-ismp`'s [`RefundingRouter`](https://github.com/polytope-labs/hyperbridge/blob/main/modules/pallets/ismp/src/dispatcher.rs) intercepts requests addressed to the built-in module id `b"HYPR-FEE"`, decodes a `WithdrawRelayerFees` payload, and transfers the owed balance from `RELAYER_FEE_ACCOUNT` to the relayer.
+
+No runtime configuration is required to enable this — it ships with `pallet-ismp`.
+
+## Pay in BRIDGE tokens
+
+The simplest integration is to run your own [relayer](/developers/network/relayer) and pay Hyperbridge in its native token, BRIDGE. Payments happen entirely offchain at the point of relaying requests to Hyperbridge, so applications don't need to attach relayer fees on dispatch. The trade-off is that you take on the relayer-operations burden — Hyperbridge's permissionless relayer network will not deliver your messages.

@@ -1,0 +1,367 @@
+// Copyright (C) Polytope Labs Ltd.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+pragma solidity ^0.8.24;
+
+import {IntentsBase} from "./IntentsBase.sol";
+import {HyperApp} from "@hyperbridge/core/apps/HyperApp.sol";
+import {IncomingPostRequest, IncomingGetResponse} from "@hyperbridge/core/interfaces/IApp.sol";
+import {DispatchPost, DispatchGet, PostRequest, IDispatcher} from "@hyperbridge/core/interfaces/IDispatcher.sol";
+import {
+    TokenInfo,
+    Order,
+    Params,
+    ParamsUpdate,
+    SweepDust,
+    WithdrawalRequest,
+    FillOptions,
+    CancelOptions,
+    Deployment
+} from "@hyperbridge/core/apps/IntentGatewayV2.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ERC1967Utils} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
+import {Address} from "@openzeppelin/contracts/utils/Address.sol";
+
+/**
+ * @title ExtrinsicIntents
+ * @author Polytope Labs (hello@polytope.technology)
+ *
+ * @dev Cross-chain intent logic & HyperApp callback handlers (onAccept, onGetResponse).
+ */
+abstract contract ExtrinsicIntents is IntentsBase, HyperApp {
+    using SafeERC20 for IERC20;
+
+    /**
+     * @dev Returns the Hyperbridge host contract address. Overrides both IntentsBase and
+     * HyperApp to resolve the diamond inheritance conflict — both parent contracts
+     * declare a virtual `host()` function.
+     * @return The host contract address from stored params.
+     */
+    function host() public view virtual override(IntentsBase, HyperApp) returns (address) {
+        return _params.host;
+    }
+
+    /**
+     * @dev Authenticates an incoming cross-chain post request by verifying that the
+     * sender module matches the registered gateway instance for the source chain.
+     * Reverts with InvalidInput if the sender address is malformed, or Unauthorized
+     * if the sender is not the expected gateway.
+     * @param request The incoming post request to authenticate.
+     */
+    function _authenticate(PostRequest calldata request) internal view {
+        if (request.from.length != 20) revert InvalidInput();
+        address module = address(bytes20(request.from));
+        if (_instance(request.source) != module) revert Unauthorized();
+    }
+
+    /**
+     * @dev Once a relayer is set, rejects deliveries from anyone else before the body is read. The
+     * host records the revert as undelivered, so the authorised relayer can resubmit. While unset,
+     * every delivery passes: a proxy from before the gate stays open until `migrate` arms it.
+     * @param relayer The account that submitted the message to the handler.
+     */
+    function _checkRelayer(address relayer) internal view {
+        address authorised = _relayer;
+        if (authorised != address(0) && relayer != authorised) revert Unauthorized();
+    }
+
+    /**
+     * @dev Rotates the authorised relayer. Host-only, so reachable only through an `Execute`
+     * request, which delegatecalls it with the host still `msg.sender`.
+     * Leaves `version()` alone; `initialize` and `migrate` arm a proxy on its way to `VERSION`.
+     * @param relayer The account whose deliveries are accepted from now on. Zero reopens the gate.
+     */
+    function setRelayer(address relayer) external onlyHost {
+        _setRelayer(relayer);
+    }
+
+    /**
+     * @dev Points the proxy at `newImplementation` and delegatecalls `data` on it in the same
+     * transaction, e.g. `migrate(relayer)`. Host-only, so reachable only through `Execute`.
+     * @param newImplementation The implementation to install; must have code.
+     * @param data Migration calldata run against the new implementation, or empty.
+     */
+    function upgradeToAndCall(address newImplementation, bytes calldata data) external onlyHost {
+        ERC1967Utils.upgradeToAndCall(newImplementation, data);
+    }
+
+    /// @dev The only writer of `_relayer`, behind `initialize`, `migrate` and `setRelayer`.
+    function _setRelayer(address relayer) internal {
+        emit RelayerUpdated({previous: _relayer, current: relayer});
+        _relayer = relayer;
+    }
+
+    /**
+     * @notice The only relayer whose `onAccept` and `onGetResponse` deliveries are accepted, or
+     * zero while the gate is open
+     */
+    function relayer() external view returns (address) {
+        return _relayer;
+    }
+
+    /// @dev `kind` followed by the ABI-encoded `WithdrawalRequest`.
+    function _body(RequestKind kind, bytes32 commitment, TokenInfo[] calldata tokens, bytes32 beneficiary)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return bytes.concat(
+            bytes1(uint8(kind)),
+            abi.encode(WithdrawalRequest({commitment: commitment, tokens: tokens, beneficiary: beneficiary}))
+        );
+    }
+
+    /// @dev Posts `body` to the gateway on the order's source chain, paying `nativeFee` in native
+    /// tokens when non-zero and in the fee token otherwise.
+    function _post(Order calldata order, bytes memory body, uint256 relayerFee, uint256 nativeFee) internal {
+        DispatchPost memory request = DispatchPost({
+            dest: order.source,
+            to: abi.encodePacked(_instance(order.source)),
+            body: body,
+            timeout: 0,
+            fee: relayerFee,
+            payer: msg.sender
+        });
+        if (nativeFee > 0) {
+            IDispatcher(host()).dispatch{value: nativeFee}(request);
+        } else {
+            dispatchWithFeeToken(request);
+        }
+    }
+
+    /**
+     * @dev Fills a cross-chain order on the destination chain. The solver provides output
+     * tokens directly to the beneficiary, and a Hyperbridge post request is dispatched
+     * back to the source chain to release the escrowed input tokens to the solver.
+     *
+     * Unlike same-chain fills, cross-chain fills are all-or-nothing — partial fills
+     * are not supported. The solver must provide at least the full required amount
+     * for every output asset.
+     *
+     * Surplus handling (when solver overpays):
+     * - If the order has attached calldata, all surplus goes to the protocol.
+     * - Otherwise, surplus is split between beneficiary and protocol per `surplusShareBps`.
+     *
+     * After transferring tokens and executing any attached calldata, dispatches a
+     * RedeemEscrow message to the source chain gateway via Hyperbridge.
+     *
+     * @param order The cross-chain order to fill.
+     * @param options Fill options including output amounts, relayer fee, and native dispatch fee.
+     * @param commitment The keccak256 hash of the ABI-encoded order.
+     */
+    function _fillCrossChain(Order calldata order, FillOptions calldata options, bytes32 commitment) internal {
+        uint256 outputsLen = order.output.assets.length;
+
+        _filled[commitment] = msg.sender;
+
+        uint256 msgValue = msg.value;
+        address beneficiary = address(uint160(uint256(order.output.beneficiary)));
+        TokenInfo[] memory outputFills = new TokenInfo[](outputsLen);
+
+        for (uint256 i; i < outputsLen; i++) {
+            bytes32 outputToken = order.output.assets[i].token;
+            if (options.outputs[i].token != outputToken) revert InvalidInput();
+
+            address token = address(uint160(uint256(outputToken)));
+            uint256 totalRequired = order.output.assets[i].amount;
+            uint256 solverAmount = options.outputs[i].amount;
+
+            if (solverAmount < totalRequired) revert InvalidInput();
+
+            (uint256 protocolShare, uint256 beneficiaryShare) =
+                _splitSurplus(solverAmount - totalRequired, order.output.call.length > 0);
+
+            if (token == address(0)) {
+                if (msgValue < solverAmount) revert InsufficientNativeToken();
+                uint256 beneficiaryTotal = totalRequired + beneficiaryShare;
+                _sendValue(beneficiary, beneficiaryTotal);
+                msgValue -= (beneficiaryTotal + protocolShare);
+            } else {
+                IERC20(token).safeTransferFrom(msg.sender, beneficiary, totalRequired + beneficiaryShare);
+                if (protocolShare > 0) {
+                    IERC20(token).safeTransferFrom(msg.sender, address(this), protocolShare);
+                }
+            }
+            if (protocolShare > 0) emit DustCollected(token, protocolShare);
+            outputFills[i] = TokenInfo({token: outputToken, amount: totalRequired});
+        }
+
+        _execute(order, outputsLen);
+
+        // Native dispatch fee only if the solver sent enough to cover it; else the fee token.
+        uint256 nativeFee = options.nativeDispatchFee;
+        if (nativeFee > msgValue) nativeFee = 0;
+        msgValue -= nativeFee;
+        _post(
+            order,
+            _body(RequestKind.RedeemEscrow, commitment, order.inputs, bytes32(uint256(uint160(msg.sender)))),
+            options.relayerFee,
+            nativeFee
+        );
+
+        // Refund any unspent native tokens to the solver.
+        if (msgValue > 0) {
+            _sendValue(msg.sender, msgValue);
+        }
+
+        emit OrderFilled({commitment: commitment, filler: msg.sender, outputs: outputFills, inputs: order.inputs});
+    }
+
+    /**
+     * @dev Initiates cancellation of a cross-chain order from the source chain.
+     *
+     * Only the order creator may cancel, and only after the order deadline has passed
+     * (verified by `options.height > order.deadline`). Dispatches a Hyperbridge GET
+     * request to the destination chain to verify that the `_filled` storage slot for
+     * this commitment is empty (i.e., the order was never filled on the destination).
+     *
+     * The GET response is handled by `onGetResponse`, which refunds the escrow if
+     * the slot is indeed empty.
+     *
+     * `cancelOrder` has already emitted `OrderCancelled`; the matching `EscrowRefunded` follows
+     * on this chain once the GET response returns through Hyperbridge.
+     *
+     * @param order The order to cancel.
+     * @param options Cancel options including the proof height and relayer fee.
+     * @param commitment The keccak256 hash of the ABI-encoded order.
+     */
+    function _cancelFromSource(Order calldata order, CancelOptions calldata options, bytes32 commitment) internal {
+        if (order.user != bytes32(uint256(uint160(msg.sender)))) revert Unauthorized();
+
+        if (options.height <= order.deadline) revert NotExpired();
+
+        uint256 inputsLen = order.inputs.length;
+        for (uint256 i; i < inputsLen;) {
+            if (_orders[commitment][address(uint160(uint256(order.inputs[i].token)))] == 0) revert UnknownOrder();
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        bytes memory context =
+            abi.encode(WithdrawalRequest({commitment: commitment, tokens: order.inputs, beneficiary: order.user}));
+
+        bytes[] memory keys = new bytes[](1);
+        keys[0] = bytes.concat(abi.encodePacked(_instance(order.destination)), _calculateCommitmentSlotHash(commitment));
+        DispatchGet memory request = DispatchGet({
+            dest: order.destination,
+            keys: keys,
+            timeout: 0,
+            height: options.height,
+            fee: options.relayerFee,
+            context: context,
+            payer: msg.sender
+        });
+
+        address hostAddr = host();
+        if (msg.value > 0) {
+            IDispatcher(hostAddr).dispatch{value: msg.value}(request);
+        } else {
+            dispatchWithFeeToken(request);
+        }
+    }
+
+    /**
+     * @dev Initiates cancellation of a cross-chain order from the destination chain.
+     *
+     * If the order deadline has not yet passed, only the order creator may cancel.
+     * After the deadline, anyone may trigger the cancellation (e.g., a relayer acting
+     * on behalf of the user).
+     *
+     * Marks the order as filled (to prevent future fill attempts) and dispatches a
+     * RefundEscrow message via Hyperbridge to the source chain to release the escrowed
+     * tokens back to the original user.
+     *
+     * `cancelOrder` has already emitted `OrderCancelled` on this chain — the only trace of the
+     * cancellation a solver watching this chain gets, since the host's `PostRequestEvent` carries
+     * no reference to the order. The matching `EscrowRefunded` follows on the source chain once
+     * Hyperbridge delivers the refund message.
+     *
+     * @param order The order to cancel.
+     * @param options Cancel options including the relayer fee.
+     * @param commitment The keccak256 hash of the ABI-encoded order.
+     */
+    function _cancelFromDest(Order calldata order, CancelOptions calldata options, bytes32 commitment) internal {
+        if (order.deadline >= _blockNumber()) {
+            if (order.user != bytes32(uint256(uint160(msg.sender)))) revert Unauthorized();
+        }
+
+        _filled[commitment] = address(uint160(uint256(order.user)));
+
+        _post(
+            order, _body(RequestKind.RefundEscrow, commitment, order.inputs, order.user), options.relayerFee, msg.value
+        );
+    }
+
+    /**
+     * @dev Handles incoming cross-chain post requests dispatched via Hyperbridge.
+     * The first byte of the request body encodes the `RequestKind`, which determines
+     * the action to take:
+     *
+     * - RedeemEscrow: Releases escrowed tokens to the solver who filled the order
+     *   on the destination chain. Authenticated against the registered gateway instance.
+     * - RefundEscrow: Refunds escrowed tokens to the original user after a successful
+     *   cancellation from the destination chain. Authenticated against the registered gateway.
+     * - NewDeployment: Registers a new gateway instance for a state machine. Only
+     *   Hyperbridge itself may dispatch this request.
+     * - UpdateParams: Updates the gateway's configuration parameters and per-destination
+     *   protocol fees. Only Hyperbridge may dispatch this request.
+     * - SweepDust: Transfers accumulated protocol dust to a specified beneficiary.
+     *   Only Hyperbridge may dispatch this request.
+     * - Execute: Delegatecalls the current implementation with the rest of the body, the host
+     *   still `msg.sender`, so the host-only functions (`upgradeToAndCall`, `setRelayer`) are
+     *   reachable. Reverts bubble up unchanged. Only Hyperbridge may dispatch this request.
+     *
+     * @param incoming The incoming post request from Hyperbridge.
+     */
+    function onAccept(IncomingPostRequest calldata incoming) external override onlyHost {
+        _checkRelayer(incoming.relayer);
+        RequestKind kind = RequestKind(uint8(incoming.request.body[0]));
+        if (kind == RequestKind.RedeemEscrow || kind == RequestKind.RefundEscrow) {
+            _authenticate(incoming.request);
+            WithdrawalRequest memory body = abi.decode(incoming.request.body[1:], (WithdrawalRequest));
+            return _withdraw(body, kind == RequestKind.RefundEscrow, true);
+        }
+
+        // only hyperbridge is permitted to perform these actions
+        if (keccak256(incoming.request.source) != keccak256(IDispatcher(host()).hyperbridge())) revert Unauthorized();
+        if (kind == RequestKind.NewDeployment) {
+            _addDeployment(abi.decode(incoming.request.body[1:], (Deployment)));
+        } else if (kind == RequestKind.UpdateParams) {
+            _updateParams(abi.decode(incoming.request.body[1:], (ParamsUpdate)));
+        } else if (kind == RequestKind.SweepDust) {
+            _sweepDust(abi.decode(incoming.request.body[1:], (SweepDust)));
+        } else if (kind == RequestKind.Execute) {
+            Address.functionDelegateCall(ERC1967Utils.getImplementation(), incoming.request.body[1:]);
+        }
+    }
+
+    /**
+     * @dev Handles the response to a Hyperbridge GET request dispatched during
+     * `_cancelFromSource`. Verifies that the `_filled` storage slot on the destination
+     * chain is empty (meaning the order was never filled), then refunds the escrowed
+     * tokens to the original user. Reverts with `Filled` if the slot is non-empty.
+     *
+     * @param incoming The incoming GET response from Hyperbridge containing the storage proof.
+     */
+    function onGetResponse(IncomingGetResponse calldata incoming) external override onlyHost {
+        _checkRelayer(incoming.relayer);
+        if (incoming.response.values[0].value.length != 0) revert Filled();
+
+        WithdrawalRequest memory body = abi.decode(incoming.response.request.context, (WithdrawalRequest));
+        _withdraw(body, true, true);
+    }
+}

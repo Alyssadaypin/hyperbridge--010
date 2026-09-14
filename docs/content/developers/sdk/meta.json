@@ -1,0 +1,12 @@
+{
+    "title": "Typescript SDK",
+    "pages": [
+        "overview",
+        "getting-started",
+        "vite-integration",
+        "hyper-fungible-token",
+        "simplex",
+        "tracking",
+        "api"
+    ]
+}

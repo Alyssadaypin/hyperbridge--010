@@ -1,0 +1,292 @@
+import { useCallback, useEffect, useState, type ComponentType, type SVGProps } from "react"
+import { api } from "../api"
+import { type OperatorTab, useTabRoute } from "../lib/route"
+import hyperfxLogo from "../assets/hyperfx-logo.webp"
+import { CopyHash } from "../components/CopyHash"
+import { ActivityIcon, LogsIcon, OperationsIcon, OverviewIcon, SettingsIcon, WalletIcon } from "../components/InterfaceIcons"
+import { OperatorSheet } from "../components/OperatorSheet"
+import { InstallAppButton } from "../components/InstallAppButton"
+import { useAction, useIsHandheld, usePolling } from "../lib/hooks"
+import type { AdminStrategyDto, BalanceSnapshot, ConfigDto, StatusOperator } from "../types"
+import { Orders } from "./Orders"
+import { Operations, type OperationsPanel } from "./Operations"
+import { Logs } from "./Logs"
+import { OperatorOverview } from "./OperatorOverview"
+import { Wallet } from "./Wallet"
+
+type Tab = OperatorTab
+
+const PAGE_TABS: Array<{
+	value: Tab
+	label: string
+	description: string
+	icon: ComponentType<SVGProps<SVGSVGElement>>
+	/** Hidden on handhelds — see {@link Operator} for why Logs is desktop-only. */
+	desktopOnly?: true
+}> = [
+	{ value: "overview", label: "Overview", description: "Health and liquidity", icon: OverviewIcon },
+	{ value: "orders", label: "Orders", description: "History and bids", icon: ActivityIcon },
+	{ value: "wallet", label: "Wallet", description: "Funds and history", icon: WalletIcon },
+	{ value: "logs", label: "Logs", description: "Live filler output", icon: LogsIcon, desktopOnly: true },
+	{ value: "operations", label: "Operations", description: "Live configuration", icon: OperationsIcon },
+]
+
+const PAGE_COPY: Record<Tab, { eyebrow: string; title: string; description: string }> = {
+	overview: {
+		eyebrow: "Live workspace",
+		title: "Overview",
+		description: "Monitor liquidity, market coverage, and the health of your running filler.",
+	},
+	orders: {
+		eyebrow: "Execution feed",
+		title: "Orders",
+		description: "Follow orders from detection through bidding and execution.",
+	},
+	wallet: {
+		eyebrow: "Treasury",
+		title: "Wallet",
+		description: "Move funds, put idle liquidity to work, and review what the filler wallet has submitted.",
+	},
+	logs: {
+		eyebrow: "Diagnostics",
+		title: "Logs",
+		description: "Everything the filler has logged since launch. The level sets what it records.",
+	},
+	operations: {
+		eyebrow: "Operator tools",
+		title: "Operations",
+		description: "Maintain live configuration without crowding the dashboard.",
+	},
+}
+
+function formatUptime(seconds: number): string {
+	const h = Math.floor(seconds / 3600)
+	const m = Math.floor((seconds % 3600) / 60)
+	return h > 0 ? `${h}h ${m}m` : `${m}m ${seconds % 60}s`
+}
+
+/**
+ * The dashboard shell.
+ *
+ * Logs is desktop-only. A log line is a wide, dense, monospace record that a
+ * phone can only show a fragment of at a time, and reading them means scanning
+ * and comparing — the one thing a 390px column is worst at. It is also the only
+ * page that holds an open stream and thousands of rows, which is real battery
+ * and memory on a device that came to the dashboard to check a balance or
+ * unpause filling. So the tab is absent on a handheld — which is a narrower
+ * test than the layout's breakpoint, because a phone in landscape is wider than
+ * it — and `/logs` sends one back to the overview rather than rendering.
+ */
+export function Operator(props: { status: StatusOperator; refresh: () => void }) {
+	const { status, refresh } = props
+	const [tab, setTab] = useTabRoute()
+	const handheld = useIsHandheld()
+	// Set when another page sends the operator to a specific Operations sheet.
+	const [operationsPanel, setOperationsPanel] = useState<OperationsPanel>()
+	const [balances, setBalances] = useState<BalanceSnapshot>()
+	const [strategies, setStrategies] = useState<AdminStrategyDto[]>([])
+	const [config, setConfig] = useState<ConfigDto>()
+	const [showEnvironment, setShowEnvironment] = useState(false)
+	const [loadError, setLoadError] = useState<string>()
+	const [stopped, setStopped] = useState(false)
+	const { run, pending, error } = useAction()
+	const page = PAGE_COPY[tab]
+
+	useEffect(() => {
+		if (handheld && tab === "logs") setTab("overview", { replace: true })
+	}, [handheld, tab, setTab])
+
+	const load = useCallback(async () => {
+		try {
+			// Status is polled too so runtime changes (overfill self-halt, an
+			// external pause) surface without a manual action.
+			const [balanceSnapshot, strategyList, configDto] = await Promise.all([
+				api.get<BalanceSnapshot>("/api/balances"),
+				api.get<{ strategies: AdminStrategyDto[] }>("/api/strategies"),
+				api.get<ConfigDto>("/api/config"),
+				refresh(),
+			])
+			setBalances(balanceSnapshot)
+			setStrategies(strategyList.strategies)
+			setConfig(configDto)
+			setLoadError(undefined)
+		} catch (err) {
+			setLoadError(err instanceof Error ? err.message : String(err))
+		}
+	}, [refresh])
+	usePolling(load, 30_000)
+
+	const togglePause = () =>
+		run(async () => {
+			await api.post(status.paused ? "/api/resume" : "/api/pause")
+			refresh()
+		})
+
+	const resetHalt = () =>
+		run(async () => {
+			await api.post("/api/reset-halt")
+			refresh()
+		})
+
+	const stopFiller = () => {
+		if (
+			!window.confirm(
+				"Stop the filler? In-flight fills drain, vault positions may unwind, and the process exits.",
+			)
+		) {
+			return
+		}
+		return run(async () => {
+			await api.post("/api/stop")
+			setStopped(true)
+		})
+	}
+	if (stopped) {
+		return (
+			<div className="card">
+				<h2>Filler stopping</h2>
+				<p className="hint">
+					In-flight fills are draining and the process will exit. Restart it with `simplex run` — a persisted
+					pause state is honored on the next boot.
+				</p>
+			</div>
+		)
+	}
+
+	return (
+		<div className="operator-shell">
+			<header className="operator-brandbar">
+				<div className="operator-brand">
+					<img className="hyperfx-logo" src={hyperfxLogo} alt="HyperFX" />
+					<span>Simplex</span>
+				</div>
+				<button type="button" className="operator-environment-trigger" onClick={() => setShowEnvironment(true)}>
+					<span className={`operator-status-dot ${status.paused ? "warn" : ""}`} />
+					<span>{status.paused ? "Filling paused" : "Filler running"}</span>
+					<SettingsIcon aria-hidden="true" />
+				</button>
+			</header>
+
+			<div className="operator-layout">
+				<aside className="operator-sidebar" aria-label="Dashboard navigation">
+					<nav>
+						{PAGE_TABS.filter((item) => !(item.desktopOnly && handheld)).map((item) => {
+							const Icon = item.icon
+							return (
+								<button
+									type="button"
+									key={item.value}
+									className="operator-nav-item"
+									data-active={tab === item.value || undefined}
+									onClick={() => setTab(item.value)}
+								>
+									<Icon aria-hidden="true" />
+									<span>
+										<strong>{item.label}</strong>
+										<small>{item.description}</small>
+									</span>
+								</button>
+							)
+						})}
+						<InstallAppButton variant="nav" />
+					</nav>
+					<div className="operator-sidebar-footer">
+						<span>Version {status.version}</span>
+						<span>Up {formatUptime(status.uptimeSec)}</span>
+					</div>
+				</aside>
+
+				<main className="operator-main" data-tab={tab}>
+					<header className="operator-page-header">
+						<div>
+							<span className="eyebrow">{page.eyebrow}</span>
+							<h1>{page.title}</h1>
+							<p>{page.description}</p>
+						</div>
+					</header>
+
+					{tab === "overview" ? (
+						<OperatorOverview
+							status={status}
+							balances={balances}
+							strategies={strategies}
+							config={config}
+							onResetHalt={resetHalt}
+							onMarketsChanged={load}
+							runtime={{ pending, onTogglePause: togglePause, onStop: stopFiller }}
+						/>
+					) : null}
+
+					{tab === "orders" ? <Orders chainLabels={status.chainLabels} /> : null}
+					{tab === "logs" && !handheld ? <Logs /> : null}
+					{tab === "wallet" ? (
+						<Wallet
+							chains={status.chains}
+							chainLabels={status.chainLabels}
+							balances={balances}
+							onBalancesChanged={load}
+							onOpenChains={() => {
+								setOperationsPanel("chains")
+								setTab("operations")
+							}}
+						/>
+					) : null}
+					{tab === "operations" ? (
+						<Operations
+							chains={status.chains}
+							initialPanel={operationsPanel}
+							onInitialPanelShown={() => setOperationsPanel(undefined)}
+						/>
+					) : null}
+					{(error ?? loadError) ? <p className="error">{error ?? loadError}</p> : null}
+				</main>
+			</div>
+
+			<OperatorSheet
+				open={showEnvironment}
+				onClose={() => setShowEnvironment(false)}
+				title="Environment"
+				description="Runtime identity and the local configuration used by this filler."
+			>
+				<div className="operator-detail-list">
+					<div>
+						<span>Status</span>
+						<strong className={status.paused ? "text-warn" : "text-ok"}>
+							{status.paused ? "Filling paused" : "Running normally"}
+						</strong>
+					</div>
+					<div>
+						<span>Uptime</span>
+						<strong>{formatUptime(status.uptimeSec)}</strong>
+					</div>
+				</div>
+				{status.addresses ? (
+					<div className="operator-identity-list">
+						<IdentityRow label="Filler wallet" value={status.addresses.evm} />
+						{status.addresses.substrate ? (
+							<IdentityRow label="Hyperbridge account" value={status.addresses.substrate} />
+						) : null}
+					</div>
+				) : null}
+				{status.configPath ? (
+					<div className="operator-config-block">
+						<span>Configuration file</span>
+						<code>{status.configPath}</code>
+					</div>
+				) : null}
+			</OperatorSheet>
+
+		</div>
+	)
+}
+
+function IdentityRow(props: { label: string; value: string }) {
+	return (
+		<div className="operator-identity-row">
+			<span>{props.label}</span>
+			<code>
+				<CopyHash value={props.value} chars={64} />
+			</code>
+		</div>
+	)
+}

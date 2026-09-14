@@ -1,0 +1,12 @@
+{
+  "title": "Explore",
+  "pages": [
+    "index",
+    "provers",
+    "relayers",
+    "network",
+    "fishermen",
+    "nexus"
+  ],
+  "defaultOpen": true
+}

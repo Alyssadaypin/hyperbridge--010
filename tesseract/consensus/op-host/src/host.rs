@@ -1,0 +1,784 @@
+use std::{sync::Arc, time::Duration};
+
+use anyhow::{anyhow, Error};
+
+use alloy::{eips::BlockId, hex, primitives::Address, providers::Provider};
+use futures::{stream, StreamExt};
+use geth_primitives::{alloy_u256_to_primitive, primitive_u256_to_alloy, CodecHeader, Header};
+use ismp::{
+	consensus::{StateCommitment, StateMachineId},
+	events::Event,
+	messaging::{ConsensusMessage, CreateConsensusState, Message, StateCommitmentHeight},
+};
+use ismp_optimism::{
+	ConsensusState, OptimismConsensusProof, OptimismConsensusType, OptimismUpdate,
+	OPTIMISM_CONSENSUS_CLIENT_ID,
+};
+use op_verifier::{calculate_output_root, GameTypeConfig, CANNON};
+use reqwest::Url;
+use sp_core::{bytes::from_hex, Encode, H160, H256, U256};
+use subxt_utils::optimism_game_type_configs_storage_key;
+use sync_committee_primitives::consensus_types::{BeaconBlockHeader, Checkpoint};
+use sync_committee_prover::{
+	responses::{self, finality_checkpoint_response::FinalityCheckpoint},
+	routes::{finality_checkpoints, header_route},
+};
+use tesseract_evm::{
+	gas_oracle::get_current_gas_cost_in_usd, tx::get_chain_gas_limit, AlloySignerProvider,
+};
+use tesseract_primitives::{Hasher, IsmpHost, IsmpProvider, StateMachineUpdated, StorageKey};
+
+use crate::{
+	abi::{DisputeGameFactory, FaultDisputeGame},
+	OpHost, ProposerConfig,
+};
+use codec::Decode;
+use ismp_optimism::OptimismConsensusType::OpFaultProofGames;
+use log::trace;
+
+/// Read the per-game-type verification configuration installed in
+/// `pallet_ismp_optimism::StateMachinesDisputeGameFactoriesTypes` on Hyperbridge for this
+/// relayer's L2. Returns `None` if the admin has not yet configured a factory for this state
+/// machine.
+async fn fetch_game_type_configs(
+	counterparty: &Arc<dyn IsmpProvider>,
+	state_machine_id: StateMachineId,
+) -> Result<Option<Vec<GameTypeConfig>>, anyhow::Error> {
+	let key = StorageKey::Substrate(optimism_game_type_configs_storage_key(state_machine_id));
+	let Some(raw) = counterparty.query_storage(key, None).await? else {
+		return Ok(None);
+	};
+	let (_factory, configs): (H160, Vec<GameTypeConfig>) = Decode::decode(&mut &*raw)
+		.map_err(|e| anyhow!("Failed to decode dispute-game factory config: {e:?}"))?;
+	Ok(Some(configs))
+}
+
+#[derive(Debug, Clone)]
+pub struct StateProposal {
+	/// output root
+	pub root_claim: H256,
+	/// l2 block number
+	pub block_number: u64,
+	/// Game type
+	pub game_type: u32,
+	/// Extra data
+	pub extra_data: Vec<u8>,
+	/// bond
+	pub bond: U256,
+}
+
+#[async_trait::async_trait]
+impl IsmpHost for OpHost {
+	async fn start_consensus(
+		&self,
+		counterparty: Arc<dyn IsmpProvider>,
+	) -> Result<(), anyhow::Error> {
+		if self.dispute_game_factory.is_some() && self.host.proposer_config.is_some() {
+			let dispute_game_factory_address = self
+				.dispute_game_factory
+				.clone()
+				.ok_or_else(|| anyhow!("Expected dispute game factory address"))?;
+
+			let proposer_config = self
+				.host
+				.proposer_config
+				.clone()
+				.ok_or_else(|| anyhow!("Expected proposer config"))?;
+
+			let proposer = self.proposer.clone().ok_or_else(|| anyhow!("Expected proposer"))?;
+
+			let client = self.clone();
+			let proposer_client = client.clone();
+
+			// Watch for requests on the opstack chain
+			// propose commitment after a confirmation delay
+			tokio::task::spawn(async move {
+				let initial_height = proposer_client.op_execution_client.get_block_number().await?;
+
+				let (tx, mut stream) = {
+					let (tx, recv) = tokio::sync::broadcast::channel(512);
+					let stream = tokio_stream::wrappers::BroadcastStream::new(recv);
+					(tx, stream)
+				};
+
+				let proposer_config_clone = proposer_config.clone();
+				let proposer_loop = async move {
+					let proposer_config = proposer_config_clone.clone();
+					let mut latest_height = initial_height;
+					log::trace!(target: crate::LOG_TARGET, "Started Proposer for {:?} at {latest_height}", proposer_client.evm.state_machine());
+
+					loop {
+						tokio::time::sleep(Duration::from_secs(30)).await;
+
+						match construct_state_proposal(
+							&proposer_client,
+							&mut latest_height,
+							dispute_game_factory_address,
+							&proposer_config,
+						)
+						.await
+						{
+							Ok(Some(proposal)) =>
+								if let Err(err) = tx.send(proposal) {
+									log::error!(target: crate::LOG_TARGET, "Failed to send state proposal: {err:?}");
+									break;
+								},
+							Ok(None) => {}, // No proposal to send
+							Err(e) => {
+								log::error!(target: crate::LOG_TARGET, "Error constructing state proposal: {e:?}");
+							},
+						}
+					}
+				};
+
+				let proposal_submit_loop = async move {
+					while let Some(proposal) = stream.next().await {
+						match proposal {
+							Ok(proposal) => {
+								if let Err(err) = submit_state_proposal(
+									&client,
+									dispute_game_factory_address,
+									proposer.clone(),
+									proposal,
+								)
+								.await
+								{
+									log::error!(target: crate::LOG_TARGET, "Error submitting state proposal: {err:?}");
+								}
+							},
+							Err(e) => {
+								log::error!(target: crate::LOG_TARGET, "Proposal stream error: {e:?}");
+							},
+						}
+					}
+				};
+
+				tokio::spawn(proposer_loop);
+				tokio::spawn(proposal_submit_loop);
+
+				Ok::<(), anyhow::Error>(())
+			});
+		}
+
+		submit_consensus_update(self, counterparty.clone()).await?;
+
+		Err(anyhow!(
+			"{}-{} consensus task has failed, Please restart relayer",
+			self.provider().name(),
+			counterparty.name()
+		))
+	}
+
+	async fn query_initial_consensus_state(
+		&self,
+	) -> Result<Option<CreateConsensusState>, anyhow::Error> {
+		let mut state_machine_commitments = vec![];
+
+		let number = self.op_execution_client.get_block_number().await?;
+		let block = self.op_execution_client.get_block(number.into()).await?.ok_or_else(|| {
+			anyhow!("Didn't find block with number {number} on {:?}", self.state_machine)
+		})?;
+		let state_machine_id = StateMachineId {
+			state_id: self.state_machine,
+			consensus_state_id: self.consensus_state_id.clone(),
+		};
+		let initial_consensus_state = ConsensusState {
+			finalized_height: number,
+			state_machine_id,
+			l1_state_machine_id: StateMachineId {
+				state_id: self.l1_state_machine,
+				consensus_state_id: self.l1_consensus_state_id,
+			},
+			optimism_consensus_type: Some(OpFaultProofGames),
+			game_type_configs: None,
+		};
+
+		state_machine_commitments.push((
+			state_machine_id,
+			StateCommitmentHeight {
+				commitment: StateCommitment {
+					timestamp: block.header.timestamp,
+					overlay_root: None,
+					state_root: block.header.state_root.0.into(),
+				},
+				height: number,
+			},
+		));
+		Ok(Some(CreateConsensusState {
+			consensus_state: initial_consensus_state.encode(),
+			consensus_client_id: OPTIMISM_CONSENSUS_CLIENT_ID,
+			consensus_state_id: self.consensus_state_id,
+			unbonding_period: u64::MAX,
+			challenge_periods: state_machine_commitments
+				.iter()
+				.map(|(state_machine, ..)| (state_machine.state_id, 5 * 60))
+				.collect(),
+			state_machine_commitments,
+		}))
+	}
+
+	fn provider(&self) -> Arc<dyn IsmpProvider> {
+		self.provider.clone()
+	}
+}
+
+async fn construct_state_proposal(
+	client: &OpHost,
+	latest_height: &mut u64,
+	dispute_game_factory_address: H160,
+	proposer_config: &ProposerConfig,
+) -> Result<Option<StateProposal>, anyhow::Error> {
+	let block_number = client.op_execution_client.get_block_number().await?;
+	if block_number <= *latest_height {
+		return Ok::<_, anyhow::Error>(None);
+	}
+
+	let event = StateMachineUpdated {
+		state_machine_id: client.provider.state_machine_id(),
+		latest_height: block_number,
+	};
+	let events = client.provider.query_ismp_events(*latest_height, event).await?;
+	*latest_height = block_number;
+	let event = events.into_iter().find(|ev| match &ev {
+		Event::PostRequest(_) | Event::GetRequest(_) => true,
+		_ => false,
+	});
+
+	if event.is_some() {
+		// Wait for end of current l1 epoch
+		let l2_header = client
+			.op_execution_client
+			.get_block(BlockId::number(*latest_height))
+			.await?
+			.ok_or_else(|| anyhow!(" Block should exist"))?;
+		let l2_header: CodecHeader = l2_header.into();
+		let parent_beacon_root = l2_header
+			.parent_beacon_root
+			.ok_or_else(|| anyhow!("Parent beacon root should be present"))?;
+		let beacon_block_id = get_block_id(parent_beacon_root);
+		let beacon_header = fetch_beacon_header(client, proposer_config, &beacon_block_id).await?;
+		let parent_beacon_epoch = beacon_header.slot / 32;
+		log::trace!(target: crate::LOG_TARGET,
+			"{} Proposer: waiting until parent beacon block is finalized before proposing;  beacon block header -> {:?}",
+			client.provider.state_machine_id().state_id,
+			parent_beacon_root
+		);
+
+		struct LatestGameData {
+			l2_block_number: u64,
+			proxy: Address,
+		}
+
+		let proposal = loop {
+			// We can only propose a state commitment when it is derived from a finalized beacon
+			// block
+			let finalized_epoch =
+				fetch_finalized_checkpoint(client, proposer_config, "head").await?.epoch;
+			if finalized_epoch >= parent_beacon_epoch {
+				log::trace!(target: crate::LOG_TARGET, "Constructing state proposal for {:?} at block {:?}", client.provider.state_machine_id().state_id, latest_height);
+				// refetch the l2 header incase there has been a reorg
+				let l2_header = client
+					.op_execution_client
+					.get_block(BlockId::number(*latest_height))
+					.await?
+					.ok_or_else(|| anyhow!(" Block should exist"))?;
+				let l2_header = l2_header.into();
+				let l2_block_hash = Header::from(&l2_header).hash::<Hasher>();
+				let commitment_block_number = *latest_height;
+
+				let message_parser_addr = Address::from_slice(&client.message_parser.0);
+				// We only need the message-parser account's storage root, not a merkle proof. Race
+				// `eth_getProof` and `eth_getAccount` and take whichever returns first.
+				let message_parser_storage_root = crate::fetch_storage_root(
+					&client.op_execution_client,
+					message_parser_addr,
+					commitment_block_number,
+				)
+				.await?;
+
+				let root_claim = calculate_output_root::<Hasher>(
+					H256::zero(),
+					l2_header.state_root,
+					message_parser_storage_root.0.into(),
+					l2_block_hash,
+				);
+
+				let extra_data = alloy_primitives::U256::from(commitment_block_number)
+					.to_be_bytes::<32>()
+					.to_vec();
+
+				let respected_game_type = CANNON;
+
+				// Check that our commitment block is greater than the latest game
+				let factory_addr = Address::from_slice(&dispute_game_factory_address.0);
+				let contract =
+					DisputeGameFactory::new(factory_addr, &*client.beacon_execution_client);
+
+				// Find the latest valid root claim with the respected game type,
+				// We only yield a new state proposal if
+				// 1. The most recent 3 games are invalid
+				// 2. The latest valid game is for a block less than our commitment block number
+				// 3. The op-proposer interval for proposing is not yet in its last quarter
+				let latest_game_count =
+					contract.gameCount().block(BlockId::latest()).call().await?;
+				let latest_game_index = alloy_u256_to_primitive(latest_game_count) - U256::one();
+				let mut proposal = None;
+				let mut latest_valid_game = None;
+				// We would inspect the first five most recent games
+				let range =
+					(latest_game_index.as_u64().saturating_sub(2))..=latest_game_index.as_u64();
+				for game_index in range.rev() {
+					let game_data = contract
+						.gameAtIndex(primitive_u256_to_alloy(U256::from(game_index)))
+						.block(BlockId::latest())
+						.call()
+						.await?;
+					let dispute_proxy = game_data.proxy_;
+
+					let game =
+						FaultDisputeGame::new(dispute_proxy, &*client.beacon_execution_client);
+
+					let latest_game_type = game.gameType().block(BlockId::latest()).call().await?;
+					// If this game is not the respected game type we continue our search
+					if latest_game_type != respected_game_type {
+						continue;
+					}
+
+					let latest_claim = game.rootClaim().block(BlockId::latest()).call().await?;
+					let latest_claim_l2_block_number = alloy_u256_to_primitive(
+						game.l2SequenceNumber().block(BlockId::latest()).call().await?,
+					)
+					.as_u64();
+
+					let latest_claim_header = client
+						.op_execution_client
+						.get_block(BlockId::number(latest_claim_l2_block_number))
+						.await?
+						.ok_or_else(|| anyhow!(" Block should exist"))?;
+					let latest_claim_header = latest_claim_header.into();
+					let message_parser_addr = Address::from_slice(&client.message_parser.0);
+					// We only need the message-parser account's storage root, not a merkle proof.
+					// Race `eth_getProof` and `eth_getAccount` and take whichever returns first.
+					let latest_claim_message_parser_storage_root = crate::fetch_storage_root(
+						&client.op_execution_client,
+						message_parser_addr,
+						latest_claim_l2_block_number,
+					)
+					.await?;
+					let latest_claim_header_block_hash =
+						Header::from(&latest_claim_header).hash::<Hasher>();
+
+					let calculated_latest_root_claim = calculate_output_root::<Hasher>(
+						H256::zero(),
+						latest_claim_header.state_root,
+						latest_claim_message_parser_storage_root.0.into(),
+						latest_claim_header_block_hash,
+					);
+
+					// If the claim in the game is incorrect we continue
+					if calculated_latest_root_claim.0 != latest_claim.0 {
+						continue;
+					}
+
+					latest_valid_game = Some(LatestGameData {
+						proxy: dispute_proxy,
+						l2_block_number: latest_claim_l2_block_number,
+					});
+
+					break;
+				}
+
+				if let Some(latest_valid_game) = latest_valid_game {
+					// If the latest game block number is greater than our block and its root claim
+					// is correct exit
+					if latest_valid_game.l2_block_number > commitment_block_number {
+						log::trace!(target: crate::LOG_TARGET,"Latest proposed block {} > commitment block{commitment_block_number}", latest_valid_game.l2_block_number);
+						break proposal;
+					}
+
+					let game_lookup = contract
+						.games(respected_game_type, root_claim.0.into(), extra_data.clone().into())
+						.block(BlockId::latest())
+						.call()
+						.await?;
+					let proxy_addr = game_lookup.proxy_;
+
+					// If game exists exit
+					if proxy_addr.0 .0 != H160::zero().0 {
+						log::trace!(target: crate::LOG_TARGET,"State commitment for {commitment_block_number} has already been proposed");
+						break proposal;
+					}
+
+					// When was the last claim submitted
+					let game = FaultDisputeGame::new(
+						latest_valid_game.proxy,
+						&*client.beacon_execution_client,
+					);
+					let creation_time = game.createdAt().block(BlockId::latest()).call().await?;
+					let current_block_num =
+						client.beacon_execution_client.get_block_number().await?;
+					let current_block_header = client
+						.beacon_execution_client
+						.get_block(BlockId::number(current_block_num))
+						.await?
+						.ok_or_else(|| anyhow!("Failed to fetch latest L1 header"))?;
+					let diff =
+						current_block_header.header.timestamp.saturating_sub(creation_time as u64);
+
+					let creator = game.gameCreator().block(BlockId::latest()).call().await?;
+					let op_proposer = from_hex(&proposer_config.op_proposer)?;
+
+					// If the time since the last proposal is greater than 3/4 of the proposal
+					// interval then it doesn't make economic sense to continue with this
+					// proposal
+					if creator.0.to_vec() == op_proposer &&
+						diff >= (3 * proposer_config.proposer_interval / 4)
+					{
+						log::trace!(target: crate::LOG_TARGET,"Skipping proposal for {commitment_block_number}, Official op-proposer should be making a proposal in {} seconds",
+							proposer_config.proposer_interval.saturating_sub((3 * proposer_config.proposer_interval )/ 4));
+						break proposal;
+					}
+
+					let bond = contract
+						.initBonds(respected_game_type)
+						.block(BlockId::latest())
+						.call()
+						.await?;
+
+					proposal = Some(StateProposal {
+						root_claim,
+						game_type: respected_game_type,
+						block_number: commitment_block_number,
+						extra_data: extra_data.clone(),
+						bond: alloy_u256_to_primitive(bond),
+					});
+
+					break proposal;
+				} else {
+					log::trace!(target: crate::LOG_TARGET,"Recent games are invalid, moving ahead with proposal for {commitment_block_number}");
+					let bond = contract
+						.initBonds(respected_game_type)
+						.block(BlockId::latest())
+						.call()
+						.await?;
+					proposal = Some(StateProposal {
+						root_claim,
+						game_type: respected_game_type,
+						block_number: commitment_block_number,
+						extra_data: extra_data.clone(),
+						bond: alloy_u256_to_primitive(bond),
+					});
+
+					break proposal;
+				}
+			}
+
+			tokio::time::sleep(Duration::from_secs(30)).await;
+		};
+		return Ok(proposal);
+	}
+	Ok(None)
+}
+
+async fn submit_state_proposal(
+	client: &OpHost,
+	dispute_game_factory_address: H160,
+	proposer: Arc<AlloySignerProvider>,
+	proposal: StateProposal,
+) -> Result<(), anyhow::Error> {
+	log::trace!(target: crate::LOG_TARGET,
+		"Proposing state commitment for {:?}, block {:?}",
+		client.provider.state_machine_id().state_id,
+		proposal.block_number
+	);
+	let factory_addr = Address::from_slice(&dispute_game_factory_address.0);
+	let contract = DisputeGameFactory::new(factory_addr, &*proposer);
+
+	let call = contract
+		.create(proposal.game_type, proposal.root_claim.0.into(), proposal.extra_data.into())
+		.value(primitive_u256_to_alloy(proposal.bond));
+
+	let gas_limit = call
+		.estimate_gas()
+		.await
+		.unwrap_or(get_chain_gas_limit(client.l1_state_machine));
+
+	// Fetch L1 gas price
+	let gas_breakdown = get_current_gas_cost_in_usd(
+		client.l1_state_machine,
+		client.ismp_host.0.into(),
+		client.beacon_execution_client.clone(),
+	)
+	.await?;
+
+	let call = call.gas_price(gas_breakdown.gas_price.low_u128()).gas(gas_limit);
+
+	let pending_tx = call.send().await?;
+	let receipt = pending_tx.get_receipt().await?;
+
+	if !receipt.status() {
+		return Err(anyhow!("Transaction failed"));
+	}
+
+	log::trace!(target: crate::LOG_TARGET, "State proposal submitted successfully for block {:?}", proposal.block_number);
+
+	Ok(())
+}
+
+async fn fetch_beacon_header(
+	client: &OpHost,
+	proposer_config: &ProposerConfig,
+	block_id: &str,
+) -> Result<BeaconBlockHeader, anyhow::Error> {
+	let beacon_consensus_client = client
+		.beacon_consensus_client
+		.clone()
+		.expect("Expected consensus client to be available");
+	let primary_url = proposer_config
+		.beacon_consensus_rpcs
+		.get(0)
+		.cloned()
+		.ok_or_else(|| anyhow!("Missing beacon rpc urls"))?;
+	let path = header_route(block_id);
+	let full_url = Url::parse(&format!("{}{}", primary_url, path))?;
+	let response = beacon_consensus_client
+		.get(full_url)
+		.send()
+		.await
+		.map_err(|e| anyhow!("Failed to fetch header with id {block_id} due to error {e:?}"))?;
+
+	let response_data = response
+		.json::<responses::beacon_block_header_response::Response>()
+		.await
+		.map_err(|e| anyhow!("Failed to fetch header with id {block_id} due to error {e:?}"))?;
+
+	let beacon_block_header = response_data.data.header.message;
+
+	Ok(beacon_block_header)
+}
+
+async fn fetch_finalized_checkpoint(
+	client: &OpHost,
+	proposer_config: &ProposerConfig,
+	block_id: &str,
+) -> Result<Checkpoint, anyhow::Error> {
+	let beacon_consensus_client = client
+		.beacon_consensus_client
+		.clone()
+		.expect("Expected consensus client to be available");
+	let primary_url = proposer_config
+		.beacon_consensus_rpcs
+		.get(0)
+		.cloned()
+		.ok_or_else(|| anyhow!("Missing beacon rpc urls"))?;
+	let path = finality_checkpoints(block_id);
+	let full_url = Url::parse(&format!("{}{}", primary_url, path))?;
+	let response = beacon_consensus_client
+		.get(full_url)
+		.send()
+		.await
+		.map_err(|e| anyhow!("Failed to fetch header with id {block_id} due to error {e:?}"))?;
+
+	#[derive(Default, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+	struct CheckpointResponse {
+		execution_optimistic: bool,
+		data: FinalityCheckpoint,
+	}
+	let response_data = response
+		.json::<CheckpointResponse>()
+		.await
+		.map_err(|e| anyhow!("Failed to fetch header with id {block_id} due to error {e:?}"))?;
+
+	let checkpoint = response_data.data.finalized;
+
+	Ok(checkpoint)
+}
+
+async fn submit_consensus_update(
+	client: &OpHost,
+	counterparty: Arc<dyn IsmpProvider>,
+) -> Result<(), anyhow::Error> {
+	let consensus_state =
+		counterparty.query_consensus_state(None, client.consensus_state_id).await?;
+	// Tolerant decode: old entries encoded before `GameTypeConfig.expected_impl`
+	// was added fall back to prefix-only, treating `game_type_configs` as None.
+	// Authoritative game configs are re-fetched from pallet storage anyway.
+	let consensus_state = ConsensusState::decode_tolerant(&consensus_state)?;
+
+	let l1_state_machine_id = StateMachineId {
+		state_id: client.l1_state_machine,
+		consensus_state_id: client.l1_consensus_state_id,
+	};
+
+	let interval = tokio::time::interval(Duration::from_secs(
+		client.host.consensus_update_frequency.unwrap_or(300),
+	));
+
+	let initial_height = counterparty.query_latest_height(l1_state_machine_id).await? as u64;
+	trace!(target: crate::LOG_TARGET, "{:?}: -> Latest height found for l1 state machine is {initial_height:?}", client.state_machine);
+	let latest_height = initial_height;
+
+	let counterparty_clone = counterparty.clone();
+	let interval_stream = stream::unfold((interval, latest_height), move |(mut interval, latest_height)| {
+		let client = client.clone();
+		let counterparty = counterparty_clone.clone();
+		let consensus_state = consensus_state.clone();
+		let state_machine = client.state_machine;
+
+		async move {
+			interval.tick().await;
+
+			let current_height =
+				match counterparty.query_latest_height(l1_state_machine_id).await {
+					Ok(height) => height,
+					Err(_) =>
+						return Some((Err(anyhow!("Not a fatal error: Error fetching l1 latest height")), (interval, latest_height),)),
+				} as u64;
+			trace!(target: crate::LOG_TARGET, "{state_machine:?}: current height found for l1 state machine is {current_height:?}");
+
+			let previous_height = latest_height;
+			if current_height <= previous_height {
+				trace!(target: crate::LOG_TARGET, "{state_machine:?}: -> current height {current_height:?} <= {previous_height:?}");
+				return Some((Ok(None), (interval, previous_height)));
+			}
+
+			trace!(target: crate::LOG_TARGET, "{state_machine:?}:  -> fetching event between {previous_height:?} and {current_height:?}");
+			return match consensus_state.optimism_consensus_type {
+				Some(OptimismConsensusType::OpL2Oracle)  => {
+					match client.latest_event(previous_height + 1, current_height).await {
+						Ok(Some(event)) => {
+							trace!(target: crate::LOG_TARGET, "{state_machine:?}: fetching l2 oracle payload");
+							match client.fetch_op_payload(current_height, event).await {
+								Ok(payload) => {
+									let update = OptimismUpdate {
+										l1_height: current_height,
+										proof: OptimismConsensusProof::OpL2Oracle(payload),
+									};
+
+									let consensus_message = ConsensusMessage {
+										consensus_proof: update.encode(),
+										consensus_state_id: client.consensus_state_id,
+										signer: counterparty.address(),
+									};
+
+									trace!(target: crate::LOG_TARGET, "gotten update for {state_machine:?}");
+
+									Some((Ok::<_, Error>(Some(consensus_message)), (interval, current_height)))
+								}
+								// Advance the pointer past this range on a payload-fetch error: the
+								// event exists but its payload can't be built (e.g. pruned state),
+								// so retrying the same range would stall. Skip ahead instead.
+								Err(_) => Some((Err(anyhow!("Not a fatal error: Error fetching op stack l2 oracle payload with height {current_height:?}")), (interval, current_height),)),
+							}
+						}
+						Ok(None) => {
+							trace!(target: crate::LOG_TARGET, "{state_machine:?}: no events fetched for op l2 oracle");
+							Some((Ok::<_, Error>(None), (interval, current_height)))
+						}
+						Err(_) => {
+							Some((
+								Err(anyhow!(
+                                "Not a fatal error: Failed to fetch latest op l2 oracle event at height {current_height:?}",
+
+                            )),
+								(interval, latest_height),
+							))
+						}
+					}
+				}
+				Some(OptimismConsensusType::OpFaultProofGames) => {
+					let l2_state_machine_id = StateMachineId {
+						state_id: client.state_machine,
+						consensus_state_id: client.consensus_state_id,
+					};
+					let game_type_configs = match fetch_game_type_configs(&counterparty, l2_state_machine_id).await {
+						Ok(Some(configs)) => configs,
+						Ok(None) => {
+							trace!(target: crate::LOG_TARGET, "{state_machine:?}: -> no dispute-game factory config installed for this state machine");
+							return Some((Ok(None), (interval, previous_height)));
+						},
+						Err(e) => return Some((
+							Err(anyhow!("Not a fatal error: failed to fetch dispute-game factory config: {e:?}")),
+							(interval, latest_height),
+						)),
+					};
+					match client.latest_dispute_games(previous_height + 1, current_height, game_type_configs.clone()).await {
+						Ok(event) => {
+							trace!(target: crate::LOG_TARGET, "{state_machine:?}: -> fetching op fault proof games payload");
+							match client.fetch_dispute_game_payload(current_height, game_type_configs, event).await {
+								Ok(maybe_payload) => {
+									if let Some(payload) = maybe_payload {
+										let update = OptimismUpdate {
+											l1_height: current_height,
+											proof: OptimismConsensusProof::OpFaultProofGames(payload),
+										};
+
+										let consensus_message = ConsensusMessage {
+											consensus_proof: update.encode(),
+											consensus_state_id: client.consensus_state_id,
+											signer: counterparty.address(),
+										};
+
+										trace!(target: crate::LOG_TARGET, "{state_machine:?}: -> gotten update");
+
+										Some((Ok::<_, Error>(Some(consensus_message)), (interval, current_height)))
+									} else {
+										trace!(target: crate::LOG_TARGET, "{state_machine:?}: -> No dispute game updates between {previous_height:?} -> {current_height:?}");
+										Some((Ok::<_, Error>(None), (interval, current_height)))
+									}
+								}
+								// Advance the pointer past this range on a payload-fetch error so a
+								// range we can't build a payload for doesn't stall the task; the
+								// next tick moves on to newer L1 heights.
+								Err(e) => Some((Err(anyhow!("Not a fatal error: Error fetching op fault proof game payload at height {current_height:?}\n{e:?}")), (interval, current_height),)),
+							}
+						}
+						Err(e) => Some((Err(anyhow!("Not a fatal error: Error fetching dispute game events at height {current_height:?}\n{e:?}")), (interval, latest_height),)),
+					}
+				}
+				_ => return Some((Err(anyhow!("Fatal error: No op stack consensus type in consensus state")), (interval, latest_height),))
+			}
+		}
+	})
+		.filter_map(|res| async move {
+			match res {
+				Ok(Some(update)) => Some(Ok(update)),
+				Ok(None) => None,
+				Err(err) => Some(Err(err)),
+			}
+		});
+
+	let provider = client.provider();
+	let mut stream = Box::pin(interval_stream);
+	while let Some(item) = stream.next().await {
+		match item {
+			Ok(consensus_message) => {
+				log::info!(
+					target: "tesseract",
+					"🛰️ Transmitting consensus message from {} to {}",
+					provider.name(), counterparty.name()
+				);
+				let res = counterparty
+					.submit(
+						vec![Message::Consensus(consensus_message)],
+						counterparty.state_machine_id().state_id,
+					)
+					.await;
+				if let Err(err) = res {
+					log::error!(target: crate::LOG_TARGET, "Failed to submit transaction to {}: {err:?}", counterparty.name())
+				}
+			},
+			Err(e) => {
+				log::error!(target: crate::LOG_TARGET, "Consensus task {}->{} encountered an error: {e:?}", provider.name(), counterparty.name())
+			},
+		}
+	}
+
+	Ok(())
+}
+
+fn get_block_id(root: H256) -> String {
+	let mut block_id = hex::encode(root.0.to_vec());
+	block_id.insert_str(0, "0x");
+	block_id
+}

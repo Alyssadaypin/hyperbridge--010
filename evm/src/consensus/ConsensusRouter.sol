@@ -1,0 +1,106 @@
+// Copyright (C) Polytope Labs Ltd.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+pragma solidity ^0.8.20;
+
+import {IConsensusV2, IntermediateState} from "@hyperbridge/core/interfaces/IConsensusV2.sol";
+import {ERC165} from "@openzeppelin/contracts/utils/introspection/ERC165.sol";
+
+/**
+ * @title The Consensus Router.
+ * @author Polytope Labs (hello@polytope.technology)
+ *
+ * @notice Routes consensus verification to the appropriate BEEFY verifier based on a
+ * single-byte proof type prefix:
+ *
+ *   0x00 (Ecdsa)      -> EcdsaBeefy: Verifies all secp256k1 signatures and authority set
+ *                        membership proofs on-chain. Most gas-expensive but fully trustless.
+ *
+ *   0x01 (SP1)         -> SP1Beefy: Delegates signature verification, authority set membership,
+ *                        and MMR leaf inclusion to an SP1 zero-knowledge proof. Cheapest on-chain
+ *                        verification at the cost of off-chain proving.
+ *
+ * The router strips the first byte before forwarding the remaining proof bytes to the
+ * selected verifier. Both verifiers implement IConsensusV2, and the
+ * router itself exposes the same interface.
+ *
+ * @dev The verifier addresses are set as immutables at construction time and cannot be changed.
+ * Reverts with EmptyProof if no proof data is provided, or InvalidProofType if the prefix
+ * byte is outside the valid range (0x00-0x01).
+ */
+contract ConsensusRouter is IConsensusV2, ERC165 {
+    // Proof type enum
+    enum ProofType {
+        // 0x00 - EcdsaBeefy (full ECDSA signature verification)
+        Ecdsa,
+        // 0x01 - SP1Beefy (zero-knowledge proof)
+        Sp1
+    }
+
+    // SP1 Beefy consensus client
+    IConsensusV2 public immutable sp1Beefy;
+
+    // EcdsaBeefy consensus client
+    IConsensusV2 public immutable ecdsaBeefy;
+
+    // Invalid proof type provided
+    error InvalidProofType(uint8 proofType);
+
+    // Empty proof provided
+    error EmptyProof();
+
+    constructor(IConsensusV2 _sp1Beefy, IConsensusV2 _ecdsaBeefy) {
+        sp1Beefy = _sp1Beefy;
+        ecdsaBeefy = _ecdsaBeefy;
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IConsensusV2).interfaceId
+            || interfaceId == bytes4(0x7d755598)
+            || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev IConsensusV2 variant that additionally returns the latest authority set id.
+     * @param previousState The ABI-encoded BeefyConsensusState.
+     * @param encodedProof The proof prefixed with a single-byte ProofType discriminator.
+     * @return The updated consensus state, newly finalized intermediate states, and the
+     *         latest authority set id from the selected verifier.
+     */
+    function verify(bytes calldata previousState, bytes calldata encodedProof)
+        external
+        view
+        returns (bytes memory, IntermediateState[] memory, uint256)
+    {
+        if (encodedProof.length == 0) revert EmptyProof();
+        uint8 proofTypeByte = uint8(encodedProof[0]);
+
+        if (proofTypeByte > uint8(type(ProofType).max)) {
+            revert InvalidProofType(proofTypeByte);
+        }
+
+        ProofType proofType = ProofType(proofTypeByte);
+        bytes calldata actualProof = encodedProof[1:];
+        if (proofType == ProofType.Sp1) {
+            return IConsensusV2(address(sp1Beefy)).verify(previousState, actualProof);
+        } else if (proofType == ProofType.Ecdsa) {
+            return IConsensusV2(address(ecdsaBeefy)).verify(previousState, actualProof);
+        } else {
+            revert InvalidProofType(proofTypeByte);
+        }
+    }
+}

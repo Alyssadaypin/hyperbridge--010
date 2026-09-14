@@ -1,0 +1,19 @@
+#!/bin/bash
+
+cargo release \
+-p serde-hex-utils \
+-p crypto-utils \
+-p beefy-verifier-primitives \
+-p ismp-abi \
+-p ismp \
+-p pallet-ismp \
+-p pallet-ismp-runtime-api \
+-p pallet-ismp-rpc \
+-p substrate-state-machine \
+-p ismp-parachain \
+-p grandpa-verifier-primitives \
+-p grandpa-verifier \
+-p ismp-grandpa \
+-p ismp-parachain-runtime-api \
+-p pallet-hyper-fungible-token \
+--execute

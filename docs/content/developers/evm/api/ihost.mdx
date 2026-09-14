@@ -1,0 +1,680 @@
+---
+title: IHost
+description: API reference for IHost - the central contract managing ISMP protocol state.
+---
+
+# IHost
+
+The central contract that manages the state of the ISMP protocol. Every chain has one `IHost` deployment that acts as the coordinator for all cross-chain communication.
+
+```solidity lineNumbers
+interface IHost is IDispatcher
+```
+
+**Inherits:** [IDispatcher](/developers/evm/api/idispatcher)
+
+## Overview
+
+The Host contract is responsible for:
+- Storing and managing consensus states
+- Tracking state machine commitments
+- Managing request lifecycles
+- Dispatching incoming messages to applications
+- Handling timeouts and fee refunds
+- Maintaining the frozen state of the protocol
+
+---
+
+## Functions
+
+### admin()
+
+Returns the administrator address that can update host parameters.
+
+```solidity lineNumbers
+function admin() external returns (address)
+```
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `address` | The admin address |
+
+---
+
+### timestamp()
+
+Returns the current timestamp of the host.
+
+```solidity lineNumbers
+function timestamp() external view returns (uint256)
+```
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `uint256` | Current block timestamp |
+
+---
+
+### consensusClient()
+
+Returns the address of the consensus client contract responsible for verifying Hyperbridge finality.
+
+```solidity lineNumbers
+function consensusClient() external view returns (address)
+```
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `address` | The consensus client contract address |
+
+---
+
+### consensusState()
+
+Returns the current encoded consensus state (authority set, latest height, etc.).
+
+```solidity lineNumbers
+function consensusState() external view returns (bytes memory)
+```
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `bytes` | Encoded consensus state |
+
+---
+
+### consensusUpdateTime()
+
+Returns the timestamp of the last consensus state update.
+
+```solidity lineNumbers
+function consensusUpdateTime() external view returns (uint256)
+```
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `uint256` | Timestamp of last update |
+
+---
+
+### latestStateMachineHeight()
+
+Returns the latest finalized height for a given state machine.
+
+```solidity lineNumbers
+function latestStateMachineHeight(uint256 stateMachineId) external view returns (uint256)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `stateMachineId` | `uint256` | The numeric identifier of the state machine |
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `uint256` | Latest height, or 0 if the state machine is unsupported |
+
+---
+
+### challengePeriod()
+
+Returns the challenge period in seconds during which state commitments can be vetoed by fishermen.
+
+```solidity lineNumbers
+function challengePeriod() external view returns (uint256)
+```
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `uint256` | Challenge period in seconds |
+
+---
+
+### unStakingPeriod()
+
+Returns the unstaking period in seconds for fishermen who veto state commitments.
+
+```solidity lineNumbers
+function unStakingPeriod() external view returns (uint256)
+```
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `uint256` | Unstaking period in seconds |
+
+---
+
+### stateMachineCommitment()
+
+Retrieves the state commitment at a specific height.
+
+```solidity lineNumbers
+function stateMachineCommitment(StateMachineHeight memory height) 
+    external 
+    payable 
+    returns (StateCommitment memory)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `height` | `StateMachineHeight` | The state machine height containing `stateMachineId` and `height` |
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `StateCommitment` | Contains overlay root, timestamp, and state root |
+
+---
+
+### stateMachineCommitmentUpdateTime()
+
+Returns the timestamp when a state commitment was stored.
+
+```solidity lineNumbers
+function stateMachineCommitmentUpdateTime(StateMachineHeight memory height) 
+    external 
+    returns (uint256)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `height` | `StateMachineHeight` | The state machine height |
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `uint256` | Timestamp when commitment was stored |
+
+---
+
+### vetoes()
+
+Returns the fisherman address who vetoed a state machine commitment.
+
+```solidity lineNumbers
+function vetoes(uint256 paraId, uint256 height) external view returns (address)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `paraId` | `uint256` | The parachain/state machine ID |
+| `height` | `uint256` | The block height |
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `address` | Fisherman who vetoed, or zero address if not vetoed |
+
+---
+
+### requestReceipts()
+
+Returns the relayer address that delivered the request.
+
+```solidity lineNumbers
+function requestReceipts(bytes32 commitment) external view returns (address)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `commitment` | `bytes32` | The request commitment hash |
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `address` | Relayer address, or zero address if not delivered |
+
+---
+
+### responseReceipts()
+
+Returns the response receipt containing the response commitment and relayer address.
+
+```solidity lineNumbers
+function responseReceipts(bytes32 commitment) external view returns (ResponseReceipt memory)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `commitment` | `bytes32` | The request commitment hash |
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `ResponseReceipt` | Contains response commitment and relayer address |
+
+---
+
+### requestCommitments()
+
+Returns fee metadata for an outgoing request.
+
+```solidity lineNumbers
+function requestCommitments(bytes32 commitment) external view returns (FeeMetadata memory)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `commitment` | `bytes32` | The request commitment hash |
+
+| Returns | Type | Description |
+|---------|------|-------------|
+| - | `FeeMetadata` | Contains relayer fee and sender address |
+
+---
+
+### setFrozenState()
+
+Sets the frozen state of the host. When frozen, certain operations are restricted.
+
+```solidity lineNumbers
+function setFrozenState(FrozenStatus newState) external
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `newState` | `FrozenStatus` | The new frozen status (None, Incoming, Outgoing, or All) |
+
+**Access:** Restricted to admin or handler
+
+**Frozen States:**
+- `None` - Normal operation
+- `Incoming` - Incoming messages frozen
+- `Outgoing` - Outgoing messages frozen
+- `All` - All operations frozen
+
+---
+
+### storeConsensusState()
+
+Stores a new consensus state. Called by the handler after verifying consensus proofs.
+
+```solidity lineNumbers
+function storeConsensusState(bytes memory state) external
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `state` | `bytes` | Encoded consensus state |
+
+**Access:** Restricted to handler
+
+---
+
+### storeStateMachineCommitment()
+
+Stores a state commitment at a specific height. Called by the handler after verifying state proofs.
+
+```solidity lineNumbers
+function storeStateMachineCommitment(
+    StateMachineHeight memory height, 
+    StateCommitment memory commitment
+) external
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `height` | `StateMachineHeight` | The state machine height |
+| `commitment` | `StateCommitment` | The state commitment |
+
+**Access:** Restricted to handler
+
+---
+
+### deleteStateMachineCommitment()
+
+Deletes a state commitment (called when vetoed by a fisherman).
+
+```solidity lineNumbers
+function deleteStateMachineCommitment(
+    StateMachineHeight memory height, 
+    address fisherman
+) external
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `height` | `StateMachineHeight` | The state machine height |
+| `fisherman` | `address` | The address of the fisherman who vetoed |
+
+**Access:** Restricted to handler
+
+---
+
+### dispatchIncoming(PostRequest)
+
+Dispatches an incoming POST request to the destination application's `onAccept()` callback.
+
+```solidity lineNumbers
+function dispatchIncoming(PostRequest memory request, address relayer) external
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `request` | `PostRequest` | The POST request |
+| `relayer` | `address` | The relayer who delivered the request |
+
+**Access:** Restricted to handler
+
+---
+
+### dispatchIncoming(GetResponse)
+
+Dispatches an incoming GET response to the source application's `onGetResponse()` callback.
+
+```solidity lineNumbers
+function dispatchIncoming(GetResponse memory response, address relayer) external
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `response` | `GetResponse` | The GET response |
+| `relayer` | `address` | The relayer who delivered the response |
+
+**Access:** Restricted to handler
+
+---
+
+### dispatchTimeOut(GetRequestTimeout)
+
+Dispatches a timed-out GET request to the source application's `onGetTimeout()` callback.
+
+```solidity lineNumbers
+function dispatchTimeOut(
+    GetRequestTimeout memory timeout, 
+    FeeMetadata memory meta, 
+    bytes32 commitment
+) external
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `timeout` | `GetRequestTimeout` | The timed-out GET request bundled with the relayer that submitted the timeout proof |
+| `meta` | `FeeMetadata` | Fee metadata |
+| `commitment` | `bytes32` | Request commitment hash |
+
+**Access:** Restricted to handler
+
+**Note:** GET requests have no relayer fees, so no refunds occur.
+
+---
+
+### dispatchTimeOut(PostRequestTimeout)
+
+Dispatches a timed-out POST request to the source application's `onPostRequestTimeout()` callback. If the callback succeeds, refunds the relayer fee to the payer.
+
+```solidity lineNumbers
+function dispatchTimeOut(
+    PostRequestTimeout memory timeout, 
+    FeeMetadata memory meta, 
+    bytes32 commitment
+) external
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `timeout` | `PostRequestTimeout` | The timed-out POST request bundled with the relayer that submitted the timeout proof |
+| `meta` | `FeeMetadata` | Fee metadata (contains payer and relayer fee) |
+| `commitment` | `bytes32` | Request commitment hash |
+
+**Access:** Restricted to handler
+
+**Important:** Fee refund only happens if the application's timeout callback succeeds.
+
+---
+
+## Events
+
+**Note:** IHost extends IDispatcher and inherits all dispatch-related events. See [IDispatcher Events](/developers/evm/api/idispatcher#events) for `PostRequestEvent`, `GetRequestEvent`, and `RequestFunded`.
+
+---
+
+### PostRequestHandled
+
+Emitted when an incoming POST request is delivered to an application.
+
+```solidity lineNumbers
+event PostRequestHandled(
+    bytes32 indexed commitment,
+    address relayer
+)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `commitment` | `bytes32` | Commitment of the incoming request |
+| `relayer` | `address` | Relayer responsible for the delivery |
+
+---
+
+### PostRequestTimeoutHandled
+
+Emitted when an outgoing POST request timeout is handled.
+
+```solidity lineNumbers
+event PostRequestTimeoutHandled(
+    bytes32 indexed commitment,
+    string dest
+)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `commitment` | `bytes32` | Commitment of the timed out request |
+| `dest` | `string` | Destination chain for this request |
+
+---
+
+### GetRequestHandled
+
+Emitted when an incoming GET request is delivered to an application.
+
+```solidity lineNumbers
+event GetRequestHandled(
+    bytes32 indexed commitment,
+    address relayer
+)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `commitment` | `bytes32` | Commitment of the GET request |
+| `relayer` | `address` | Relayer responsible for the delivery |
+
+---
+
+### GetRequestTimeoutHandled
+
+Emitted when an outgoing GET request timeout is handled.
+
+```solidity lineNumbers
+event GetRequestTimeoutHandled(
+    bytes32 indexed commitment,
+    string dest
+)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `commitment` | `bytes32` | Commitment of the GET request |
+| `dest` | `string` | Destination chain for this request |
+
+---
+
+### StateMachineUpdated
+
+Emitted when new heights are finalized for a state machine.
+
+```solidity lineNumbers
+event StateMachineUpdated(
+    string stateMachineId,
+    uint256 height
+)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `stateMachineId` | `string` | The state machine that was just updated |
+| `height` | `uint256` | The newly updated height |
+
+---
+
+### StateCommitmentVetoed
+
+Emitted when a state commitment is vetoed by a fisherman.
+
+```solidity lineNumbers
+event StateCommitmentVetoed(
+    string stateMachineId,
+    uint256 height,
+    StateCommitment stateCommitment,
+    address indexed fisherman
+)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `stateMachineId` | `string` | The state machine identifier for the vetoed state commitment |
+| `height` | `uint256` | The height that was vetoed |
+| `stateCommitment` | `StateCommitment` | The state commitment that was vetoed |
+| `fisherman` | `address` | The fisherman responsible for the veto |
+
+---
+
+
+
+### HostFrozen
+
+Emitted when the frozen status of the host changes.
+
+```solidity lineNumbers
+event HostFrozen(
+    FrozenStatus status
+)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `status` | `FrozenStatus` | New frozen status |
+
+---
+
+### HostParamsUpdated
+
+Emitted when the host parameters are updated.
+
+```solidity lineNumbers
+event HostParamsUpdated(
+    HostParams oldParams,
+    HostParams newParams
+)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `oldParams` | `HostParams` | The old host parameters |
+| `newParams` | `HostParams` | The new host parameters |
+
+---
+
+### HostWithdrawal
+
+Emitted when the host processes a withdrawal.
+
+```solidity lineNumbers
+event HostWithdrawal(
+    uint256 amount,
+    address beneficiary,
+    address token
+)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `amount` | `uint256` | Amount that was withdrawn |
+| `beneficiary` | `address` | The beneficiary address for this withdrawal |
+| `token` | `address` | The token that was withdrawn (`address(0)` for native token) |
+
+---
+
+## Structs
+
+### StateMachineHeight
+
+```solidity lineNumbers
+struct StateMachineHeight {
+    uint256 stateMachineId;
+    uint256 height;
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `stateMachineId` | `uint256` | The numeric identifier of the state machine |
+| `height` | `uint256` | The block height/number |
+
+---
+
+### StateCommitment
+
+```solidity lineNumbers
+struct StateCommitment {
+    uint256 timestamp;
+    bytes32 overlayRoot;
+    bytes32 stateRoot;
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `timestamp` | `uint256` | Block timestamp |
+| `overlayRoot` | `bytes32` | Root of the overlay tree (for child chains) |
+| `stateRoot` | `bytes32` | Root of the state trie |
+
+---
+
+### FeeMetadata
+
+```solidity lineNumbers
+struct FeeMetadata {
+    address sender;
+    uint256 fee;
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sender` | `address` | Address that sent the message or will receive refund |
+| `fee` | `uint256` | Relayer fee amount in fee token |
+
+---
+
+### ResponseReceipt
+
+```solidity lineNumbers
+struct ResponseReceipt {
+    bytes32 responseCommitment;
+    address relayer;
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `responseCommitment` | `bytes32` | Hash of the response |
+| `relayer` | `address` | Address of relayer who delivered the response |
+
+---
+
+### FrozenStatus
+
+```solidity lineNumbers
+enum FrozenStatus {
+    None,
+    Incoming,
+    Outgoing,
+    All
+}
+```
+
+| Value | Description |
+|-------|-------------|
+| `None` | Normal operation, no restrictions |
+| `Incoming` | Incoming messages are frozen |
+| `Outgoing` | Outgoing messages are frozen |
+| `All` | All operations are frozen |
+
+---

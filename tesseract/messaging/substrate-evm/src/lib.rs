@@ -1,0 +1,571 @@
+/// Log/tracing target for this crate.
+pub const LOG_TARGET: &str = "messaging-substrate-evm";
+
+use anyhow::{Error, anyhow};
+use codec::{Decode, Encode};
+use evm_state_machine::{
+	substrate_evm::{AccountInfo, AccountType, SubstrateEvmError},
+	types::SubstrateEvmProof,
+};
+use ismp::{
+	consensus::{ConsensusStateId, StateCommitment, StateMachineHeight, StateMachineId},
+	events::{Event, StateCommitmentVetoed},
+	host::StateMachine,
+	messaging::{CreateConsensusState, Message},
+};
+use ismp_parachain::consensus::{
+	ASSET_HUB_MAINNET_CHAIN_ID, ASSET_HUB_PARA_ID, PASSET_HUB_TESTNET_CHAIN_ID,
+};
+use pallet_ismp_host_executive::HostParam;
+use polkadot_sdk::*;
+use primitive_types::U256;
+use sp_core::{Bytes, H160, H256, storage::ChildInfo};
+use sp_crypto_hashing::{blake2_256, twox_128};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use substrate_state_machine::fetch_overlay_root_and_timestamp;
+use subxt::{
+	OnlineClient,
+	backend::rpc::RpcClient,
+	config::{ExtrinsicParams, HashFor, substrate::SubstrateHeader},
+	ext::subxt_rpcs::{LegacyRpcMethods, rpc_params},
+	tx::DefaultParams,
+	utils::{AccountId32, MultiSignature},
+};
+use tesseract_evm::{EvmClient, EvmConfig};
+use tesseract_primitives::{
+	BoxStream, ByzantineHandler, EstimateGasReturnParams, IsmpProvider, Query, Signature,
+	StateMachineUpdated, StateProofQueryType, StorageKey, TxResult,
+};
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct SubstrateEvmClientConfig {
+	#[serde(flatten)]
+	pub evm: EvmConfig,
+	// Substrate websocket url
+	pub ws_url: String,
+}
+
+#[derive(Clone)]
+pub struct SubstrateEvmClient<C: subxt::Config> {
+	pub evm: EvmClient,
+	pub online_client: OnlineClient<C>,
+	pub legacy_rpc: LegacyRpcMethods<C>,
+	pub subxt_rpc_client: RpcClient,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ReadProof<H> {
+	pub at: H,
+	pub proof: Vec<Bytes>,
+}
+
+impl<C: subxt::Config> SubstrateEvmClient<C>
+where
+	C: subxt::Config + Send + Sync + Clone,
+	C::Header: Send + Sync,
+	C::AccountId: From<AccountId32> + Into<C::Address> + Clone + 'static + Send + Sync + Encode,
+	C::Signature: From<MultiSignature> + Send + Sync,
+	H256: From<HashFor<C>>,
+	<C::ExtrinsicParams as ExtrinsicParams<C>>::Params: Send + Sync + DefaultParams,
+{
+	pub async fn new(config: SubstrateEvmClientConfig) -> Result<Self, anyhow::Error> {
+		let evm = EvmClient::new(config.evm).await?;
+		let (online_client, rpc_client) =
+			subxt_utils::client::ws_client(&config.ws_url, 300u32 * 1024 * 1024).await?;
+		let legacy_rpc = LegacyRpcMethods::<C>::new(rpc_client.clone());
+		Ok(Self { evm, online_client, legacy_rpc, subxt_rpc_client: rpc_client })
+	}
+
+	/// Para id of this chain, as `pallet-ismp-parachain` keys it on hyperbridge.
+	///
+	/// Asset Hub is relayed under its EVM chain id rather than its parachain id, so it needs the
+	/// same remapping the consensus client applies when it records commitments.
+	fn para_id(&self) -> Result<u32, anyhow::Error> {
+		match self.state_machine_id().state_id {
+			StateMachine::Polkadot(id) | StateMachine::Kusama(id) => Ok(id),
+			StateMachine::Evm(id)
+				if id == ASSET_HUB_MAINNET_CHAIN_ID || id == PASSET_HUB_TESTNET_CHAIN_ID =>
+			{
+				Ok(ASSET_HUB_PARA_ID)
+			},
+			state_machine => Err(anyhow!("No parachain id known for {state_machine}")),
+		}
+	}
+
+	/// The aura slot duration in milliseconds that hyperbridge derives this chain's block
+	/// timestamps from, read straight out of `pallet-ismp-parachain`'s `SlotDurations` map on the
+	/// counterparty.
+	///
+	/// Deliberately sourced from the counterparty rather than from this chain's own `AuraApi`:
+	/// the governance-set value is the one the consensus client actually used to build the
+	/// commitment we're checking, so reading it here means an honest commitment can never be
+	/// vetoed over a disagreement about slot duration. Read at hyperbridge's tip — the value
+	/// only ever changes by governance, and never retroactively.
+	async fn slot_duration(
+		&self,
+		counterparty: &Arc<dyn IsmpProvider>,
+	) -> Result<u64, anyhow::Error> {
+		let para_id = self.para_id()?;
+		let key = StorageKey::Substrate(subxt_utils::parachain_slot_duration_storage_key(para_id));
+		let raw = counterparty
+			.query_storage(key, None)
+			.await?
+			.ok_or_else(|| anyhow!("No slot duration configured for parachain {para_id}"))?;
+
+		u64::decode(&mut &*raw).map_err(|err| anyhow!("SCALE decode slot duration: {err:?}"))
+	}
+
+	/// Reconstructs the block timestamp `pallet-ismp-parachain` records for this header, in
+	/// seconds.
+	///
+	/// Parachains running `pallet-ismp` deposit an ISMP timestamp digest and the slot duration is
+	/// never consulted; the rest fall back to `slot * slot_duration`, so the slot duration is only
+	/// fetched from the counterparty when the digest is absent.
+	async fn header_timestamp(
+		&self,
+		header: &SubstrateHeader<u32, C::Hasher>,
+		counterparty: &Arc<dyn IsmpProvider>,
+	) -> Result<u64, anyhow::Error> {
+		let digest =
+			polkadot_sdk::sp_runtime::generic::Digest::decode(&mut &*header.digest.encode())?;
+
+		// A zero slot duration makes the helper fail whenever the ISMP digest is missing, which
+		// is exactly the signal that we need to go ask hyperbridge for the slot duration.
+		if let Ok(result) = fetch_overlay_root_and_timestamp(&digest, 0) {
+			return Ok(result.timestamp);
+		}
+
+		let slot_duration = self.slot_duration(counterparty).await?;
+		fetch_overlay_root_and_timestamp(&digest, slot_duration)
+			.map(|result| result.timestamp)
+			.map_err(|err| anyhow!("Failed to derive timestamp from header digest: {err:?}"))
+	}
+
+	pub fn storage_key(&self, slot: H256) -> Vec<u8> {
+		blake2_256(slot.as_bytes()).to_vec()
+	}
+
+	pub fn contract_info_key(&self, address: H160) -> Vec<u8> {
+		let mut key = Vec::new();
+		key.extend_from_slice(&twox_128(b"Revive"));
+		key.extend_from_slice(&twox_128(b"AccountInfoOf"));
+		key.extend_from_slice(address.as_bytes());
+		key
+	}
+
+	pub async fn get_contract_trie_id(
+		&self,
+		address: H160,
+		at: HashFor<C>,
+	) -> Result<Vec<u8>, Error> {
+		let key = self.contract_info_key(address);
+
+		let data = self
+			.online_client
+			.storage()
+			.at(at)
+			.fetch_raw(key)
+			.await?
+			.ok_or_else(|| anyhow::anyhow!("Contract info not found"))?;
+
+		let input = &data[..];
+
+		let account_info = AccountInfo::decode(&mut &input[..])
+			.map_err(|_| SubstrateEvmError::AccountInfoDecodeError)?;
+
+		let AccountType::Contract(contract_info) = account_info.account_type;
+		let trie_id: Vec<u8> = contract_info.trie_id;
+
+		Ok(trie_id)
+	}
+
+	/// Fetches a combined prrof: Main Trie (ContractInfo + ChildRoot) amd Child Trie (Slots)
+	async fn fetch_combined_proof(
+		&self,
+		at: u64,
+		queries: Vec<(H160, Vec<Vec<u8>>)>,
+	) -> Result<Vec<u8>, Error> {
+		let block_hash = self
+			.legacy_rpc
+			.chain_get_block_hash(Some(at.into()))
+			.await?
+			.ok_or_else(|| anyhow::anyhow!("Block hash not found for height {at}"))?;
+
+		let mut main_keys = Vec::new();
+		let mut contract_info = BTreeMap::new();
+
+		for (contract_address, _) in &queries {
+			let trie_id = self.get_contract_trie_id(*contract_address, block_hash).await?;
+			let account_info_key = self.contract_info_key(*contract_address);
+
+			let child_info = ChildInfo::new_default(&trie_id);
+			let child_root_key = child_info.prefixed_storage_key().into_inner();
+
+			main_keys.push(sp_storage::StorageKey(account_info_key));
+			main_keys.push(sp_storage::StorageKey(child_root_key));
+
+			contract_info.insert(contract_address.as_bytes().to_vec(), child_info);
+		}
+
+		let main_proof: ReadProof<H256> = self
+			.subxt_rpc_client
+			.request("state_getReadProof", rpc_params![main_keys, Some(block_hash)])
+			.await?;
+
+		let mut storage_proofs = BTreeMap::new();
+
+		for (contract_address, keys) in queries {
+			let child_info = contract_info
+				.get(contract_address.as_bytes())
+				.expect("Contract Info should exist");
+
+			let keys = keys.into_iter().map(|key| sp_storage::StorageKey(key)).collect::<Vec<_>>();
+			let child_proof: ReadProof<H256> = self
+				.subxt_rpc_client
+				.request(
+					"state_getChildReadProof",
+					rpc_params![child_info.prefixed_storage_key(), keys, Some(block_hash)],
+				)
+				.await?;
+
+			storage_proofs.insert(
+				contract_address.as_bytes().to_vec(),
+				child_proof.proof.into_iter().map(|b| b.0).collect(),
+			);
+		}
+		let substrate_evm_proof = SubstrateEvmProof {
+			main_proof: main_proof.proof.into_iter().map(|b| b.0).collect(),
+			storage_proof: storage_proofs,
+		};
+
+		Ok(substrate_evm_proof.encode())
+	}
+}
+
+#[async_trait::async_trait]
+impl<C> IsmpProvider for SubstrateEvmClient<C>
+where
+	C: subxt::Config + Send + Sync + Clone,
+	C::Header: Send + Sync,
+	C::AccountId: From<AccountId32> + Into<C::Address> + Clone + 'static + Send + Sync + Encode,
+	C::Signature: From<MultiSignature> + Send + Sync,
+	H256: From<HashFor<C>>,
+	<C::ExtrinsicParams as ExtrinsicParams<C>>::Params: Send + Sync + DefaultParams,
+{
+	async fn query_consensus_state(
+		&self,
+		at: Option<u64>,
+		id: ConsensusStateId,
+	) -> Result<Vec<u8>, Error> {
+		self.evm.query_consensus_state(at, id).await
+	}
+
+	async fn query_latest_height(&self, id: StateMachineId) -> Result<u32, Error> {
+		self.evm.query_latest_height(id).await
+	}
+
+	async fn query_finalized_height(&self) -> Result<u64, Error> {
+		self.evm.query_finalized_height().await
+	}
+
+	async fn query_state_machine_commitment(
+		&self,
+		height: StateMachineHeight,
+	) -> Result<StateCommitment, Error> {
+		self.evm.query_state_machine_commitment(height).await
+	}
+
+	async fn query_state_machine_update_time(
+		&self,
+		height: StateMachineHeight,
+	) -> Result<Duration, Error> {
+		self.evm.query_state_machine_update_time(height).await
+	}
+
+	async fn query_challenge_period(&self, id: StateMachineId) -> Result<Duration, Error> {
+		self.evm.query_challenge_period(id).await
+	}
+
+	async fn query_timestamp(&self) -> Result<Duration, Error> {
+		self.evm.query_timestamp().await
+	}
+
+	async fn query_requests_proof(
+		&self,
+		at: u64,
+		keys: Vec<Query>,
+		_counterparty: StateMachine,
+	) -> Result<Vec<u8>, Error> {
+		let storage_keys: Vec<Vec<u8>> = keys
+			.into_iter()
+			.map(|q| {
+				let slot_hash = self.evm.request_commitment_key(q.commitment).1;
+				self.storage_key(slot_hash)
+			})
+			.collect();
+
+		self.fetch_combined_proof(at, vec![(self.evm.ismp_host, storage_keys)]).await
+	}
+
+	async fn query_state_proof(
+		&self,
+		at: u64,
+		keys: StateProofQueryType,
+	) -> Result<Vec<u8>, Error> {
+		match keys {
+			StateProofQueryType::Ismp(keys) => {
+				if keys.iter().any(|key| key.len() != 32) {
+					return Err(anyhow::anyhow!("All ISMP keys must have a length of 32 bytes",));
+				}
+				let storage_keys: Vec<Vec<u8>> = keys
+					.into_iter()
+					.map(|key| {
+						let slot = H256::from_slice(&key);
+						self.storage_key(slot)
+					})
+					.collect();
+
+				self.fetch_combined_proof(at, vec![(self.evm.ismp_host, storage_keys)]).await
+			},
+			StateProofQueryType::Arbitrary(keys) => {
+				let mut groups: BTreeMap<H160, Vec<Vec<u8>>> = BTreeMap::new();
+				for key in keys.into_iter() {
+					if key.len() != 52 {
+						anyhow::bail!(
+							"All arbitrary keys must have a length of 53 bytes, found {}",
+							key.len()
+						);
+					}
+					let address = H160::from_slice(&key[..20]);
+					let slot = H256::from_slice(&key[20..]);
+					let storage_key = self.storage_key(slot);
+
+					groups.entry(address).or_default().push(storage_key);
+				}
+				self.fetch_combined_proof(at, groups.into_iter().collect()).await
+			},
+		}
+	}
+
+	async fn query_ismp_events(
+		&self,
+		previous_height: u64,
+		event: StateMachineUpdated,
+	) -> Result<Vec<Event>, Error> {
+		self.evm.query_ismp_events(previous_height, event).await
+	}
+
+	fn name(&self) -> String {
+		self.evm.name()
+	}
+
+	fn state_machine_id(&self) -> StateMachineId {
+		self.evm.state_machine_id()
+	}
+
+	fn ismp_host_contract(&self) -> Option<H160> {
+		self.evm.ismp_host_contract()
+	}
+
+	fn block_max_gas(&self) -> u64 {
+		self.evm.block_max_gas()
+	}
+
+	fn initial_height(&self) -> u64 {
+		self.evm.initial_height()
+	}
+
+	async fn estimate_gas(&self, msg: Vec<Message>) -> Result<Vec<EstimateGasReturnParams>, Error> {
+		self.evm.estimate_gas(msg).await
+	}
+
+	async fn estimate_gas_batched(
+		&self,
+		prelude: Option<Message>,
+		msgs: Vec<Message>,
+	) -> Result<Vec<EstimateGasReturnParams>, Error> {
+		self.evm.estimate_gas_batched(prelude, msgs).await
+	}
+
+	async fn query_request_fee_metadata(&self, hash: H256) -> Result<U256, Error> {
+		self.evm.query_request_fee_metadata(hash).await
+	}
+
+	async fn query_request_receipt(&self, hash: H256) -> Result<Vec<u8>, Error> {
+		self.evm.query_request_receipt(hash).await
+	}
+
+	async fn query_response_receipt(&self, hash: H256) -> Result<Vec<u8>, Error> {
+		self.evm.query_response_receipt(hash).await
+	}
+
+	async fn state_machine_update_notification(
+		&self,
+		counterparty_state_id: StateMachineId,
+	) -> Result<BoxStream<StateMachineUpdated>, Error> {
+		self.evm.state_machine_update_notification(counterparty_state_id).await
+	}
+
+	async fn state_commitment_vetoed_notification(
+		&self,
+		from: u64,
+		height: StateMachineHeight,
+	) -> BoxStream<StateCommitmentVetoed> {
+		self.evm.state_commitment_vetoed_notification(from, height).await
+	}
+
+	async fn submit(
+		&self,
+		messages: Vec<Message>,
+		coprocessor: StateMachine,
+	) -> Result<TxResult, Error> {
+		self.evm.submit(messages, coprocessor).await
+	}
+
+	fn request_commitment_full_key(&self, commitment: H256) -> Vec<Vec<u8>> {
+		self.evm.request_commitment_full_key(commitment)
+	}
+
+	fn request_receipt_full_key(&self, commitment: H256) -> Vec<Vec<u8>> {
+		self.evm.request_receipt_full_key(commitment)
+	}
+
+	fn address(&self) -> Vec<u8> {
+		self.evm.address()
+	}
+
+	fn sign(&self, msg: &[u8]) -> Signature {
+		self.evm.sign(msg)
+	}
+
+	async fn set_latest_finalized_height(
+		&mut self,
+		counterparty: Arc<dyn IsmpProvider>,
+	) -> Result<(), Error> {
+		self.evm.set_latest_finalized_height(counterparty).await
+	}
+
+	async fn set_initial_consensus_state(
+		&self,
+		message: CreateConsensusState,
+	) -> Result<(), Error> {
+		self.evm.set_initial_consensus_state(message).await
+	}
+
+	async fn veto_state_commitment(&self, height: StateMachineHeight) -> Result<(), Error> {
+		self.evm.veto_state_commitment(height).await
+	}
+
+	async fn query_host_params(&self, state_machine: StateMachine) -> Result<HostParam, Error> {
+		self.evm.query_host_params(state_machine).await
+	}
+
+	fn max_concurrent_queries(&self) -> usize {
+		self.evm.max_concurrent_queries()
+	}
+
+	async fn fee_token_decimals(&self) -> Result<u8, Error> {
+		self.evm.fee_token_decimals().await
+	}
+}
+
+#[async_trait::async_trait]
+impl<C> ByzantineHandler for SubstrateEvmClient<C>
+where
+	C: subxt::Config + Send + Sync + Clone,
+	C::Header: Send + Sync,
+	C::AccountId: From<AccountId32> + Into<C::Address> + Clone + 'static + Send + Sync + Encode,
+	C::Signature: From<MultiSignature> + Send + Sync,
+	H256: From<HashFor<C>>,
+	<C::ExtrinsicParams as ExtrinsicParams<C>>::Params: Send + Sync + DefaultParams,
+{
+	async fn check_for_byzantine_attack(
+		&self,
+		_coprocessor: StateMachine,
+		counterparty: Arc<dyn IsmpProvider>,
+		event: StateMachineUpdated,
+	) -> Result<(), Error> {
+		let height = StateMachineHeight {
+			id: StateMachineId {
+				state_id: self.state_machine_id().state_id,
+				consensus_state_id: self.state_machine_id().consensus_state_id,
+			},
+			height: event.latest_height,
+		};
+
+		let Some(block_hash) =
+			self.legacy_rpc.chain_get_block_hash(Some(event.latest_height.into())).await?
+		else {
+			// If block header is not found veto the state commitment
+
+			log::info!(
+				target: LOG_TARGET, "Vetoing state commitment for {} on {}: block header not found for {}",
+				self.state_machine_id().state_id,
+				counterparty.state_machine_id().state_id,
+				event.latest_height
+			);
+			counterparty.veto_state_commitment(height).await?;
+
+			return Ok(());
+		};
+		let header = self
+			.legacy_rpc
+			.chain_get_header(Some(block_hash))
+			.await?
+			.ok_or_else(|| anyhow!("Failed to get block header in byzantine handler"))?;
+
+		let header = SubstrateHeader::<u32, C::Hasher>::decode(&mut &*header.encode())?;
+
+		let state_root: H256 = header.state_root.into();
+		let finalized_state_commitment =
+			counterparty.query_state_machine_commitment(height).await?;
+
+		let state_root_mismatch = finalized_state_commitment.state_root != state_root.into();
+		// The commitment's timestamp is reconstructed exactly the way `pallet-ismp-parachain`
+		// does it — from the ISMP timestamp digest when the parachain runs `pallet-ismp`, and
+		// from `slot * slot_duration` otherwise. Anything else recorded against this height is
+		// forged, and a skewed timestamp is as damaging as a forged state root: timeouts are
+		// settled against it, so it either strands messages or expires them early.
+		//
+		// Kept best-effort on purpose. A chain with neither an ISMP digest nor a slot duration
+		// configured on hyperbridge leaves us no honest timestamp to compare against, and losing
+		// the state root check too would be the worse outcome — so we warn and check the state
+		// root alone.
+		let derived_timestamp = match self.header_timestamp(&header, &counterparty).await {
+			Ok(timestamp) => Some(timestamp),
+			Err(err) => {
+				log::warn!(
+					target: LOG_TARGET,
+					"Could not derive block timestamp for {} at height {}, skipping timestamp check: {err:?}",
+					self.state_machine_id().state_id,
+					event.latest_height,
+				);
+				None
+			},
+		};
+		let timestamp_mismatch = derived_timestamp
+			.is_some_and(|timestamp| finalized_state_commitment.timestamp != timestamp);
+
+		if state_root_mismatch || timestamp_mismatch {
+			log::info!(
+				target: LOG_TARGET, "Vetoing state commitment for {} on {} at height {}: recorded (state root {:?}, timestamp {}) disagrees with header (state root {:?}, timestamp {derived_timestamp:?})",
+				self.state_machine_id().state_id,
+				counterparty.state_machine_id().state_id,
+				event.latest_height,
+				finalized_state_commitment.state_root,
+				finalized_state_commitment.timestamp,
+				state_root,
+			);
+			counterparty.veto_state_commitment(height).await?;
+		}
+
+		Ok(())
+	}
+
+	async fn state_machine_updates(
+		&self,
+		counterparty_state_id: StateMachineId,
+	) -> Result<BoxStream<Vec<StateMachineUpdated>>, Error> {
+		self.evm.state_machine_updates(counterparty_state_id).await
+	}
+}
